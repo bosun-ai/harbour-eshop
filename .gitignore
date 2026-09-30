@@ -1,0 +1,7 @@
+# Created by eshop at runtime
+app/*.cdx
+app/*.log
+app/.uhttpd.stop
+app/private.key
+app/certificate.crt
+app/eshop

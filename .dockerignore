@@ -1,0 +1,7 @@
+.git
+.github
+app/*.cdx
+app/*.log
+app/private.key
+app/certificate.crt
+app/eshop
