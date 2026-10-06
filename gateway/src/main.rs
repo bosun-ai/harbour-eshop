@@ -66,5 +66,17 @@ async fn route(
     })
 }
 async fn shutdown_signal() -> Result<(), std::io::Error> {
-    tokio::signal::ctrl_c().await
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => signal,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
 }

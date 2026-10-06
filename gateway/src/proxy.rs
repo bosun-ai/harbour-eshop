@@ -66,23 +66,7 @@ impl LegacyUpstream {
         let request_id = Uuid::new_v4().to_string();
         remove_hop_by_hop(request.headers_mut());
         request.headers_mut().remove(HOST);
-        request.headers_mut().remove("x-forwarded-for");
-        request.headers_mut().remove("x-forwarded-proto");
-        request.headers_mut().insert(
-            "x-request-id",
-            request_id.parse().expect("UUID is a valid header value"),
-        );
-        request.headers_mut().insert(
-            "x-forwarded-for",
-            client_ip
-                .to_string()
-                .parse()
-                .expect("IP address is a valid header value"),
-        );
-        request.headers_mut().insert(
-            "x-forwarded-proto",
-            "https".parse().expect("constant is a valid header value"),
-        );
+        set_gateway_forwarding_headers(request.headers_mut(), client_ip, &request_id);
         *request.uri_mut() = uri;
 
         let response = match time::timeout(self.request_timeout, self.client.request(request)).await
@@ -105,6 +89,42 @@ impl LegacyUpstream {
         remove_hop_by_hop(response.headers_mut());
         response
     }
+}
+
+fn set_gateway_forwarding_headers(
+    headers: &mut hyper::HeaderMap,
+    client_ip: IpAddr,
+    request_id: &str,
+) {
+    let forwarded_headers = headers
+        .keys()
+        .filter(|name| {
+            name.as_str() == "forwarded"
+                || name.as_str() == "x-real-ip"
+                || name.as_str().starts_with("x-forwarded-")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for name in forwarded_headers {
+        headers.remove(name);
+    }
+    headers.insert(
+        "x-request-id",
+        request_id
+            .parse()
+            .expect("request ID is a valid header value"),
+    );
+    headers.insert(
+        "x-forwarded-for",
+        client_ip
+            .to_string()
+            .parse()
+            .expect("IP address is a valid header value"),
+    );
+    headers.insert(
+        "x-forwarded-proto",
+        "https".parse().expect("constant is a valid header value"),
+    );
 }
 
 fn upstream_uri(origin: &Url, incoming: &Uri) -> Result<Uri, ()> {
@@ -150,6 +170,43 @@ fn error_response(status: StatusCode, message: &'static str) -> Response<Gateway
                 .boxed(),
         )
         .expect("fixed error response")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use hyper::header::HeaderValue;
+
+    use super::set_gateway_forwarding_headers;
+
+    #[test]
+    fn client_forwarding_metadata_is_not_sent_upstream() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "forwarded",
+            HeaderValue::from_static("for=203.0.113.10;host=evil.test"),
+        );
+        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.10"));
+        headers.insert("x-forwarded-host", HeaderValue::from_static("evil.test"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        headers.insert("x-real-ip", HeaderValue::from_static("203.0.113.10"));
+        headers.insert("cookie", HeaderValue::from_static("session=opaque"));
+
+        set_gateway_forwarding_headers(
+            &mut headers,
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 42)),
+            "gateway-request-id",
+        );
+
+        assert!(headers.get("forwarded").is_none());
+        assert!(headers.get("x-forwarded-host").is_none());
+        assert!(headers.get("x-real-ip").is_none());
+        assert_eq!(headers["x-forwarded-for"], "198.51.100.42");
+        assert_eq!(headers["x-forwarded-proto"], "https");
+        assert_eq!(headers["x-request-id"], "gateway-request-id");
+        assert_eq!(headers["cookie"], "session=opaque");
+    }
 }
 
 pin_project! {

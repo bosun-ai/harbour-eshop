@@ -64,7 +64,11 @@ curl -skD "$headers" -c "$cookies" -b "$cookies" -o /dev/null \
   -d 'user=gatewaytest&name=Gateway+Test&password1=secret&password2=secret&register=1' "$base/app/register"
 grep -q '^HTTP/.* 302 ' "$headers"
 grep -qi '^set-cookie:.*path=' "$headers"
-curl -skf -c "$cookies" -b "$cookies" -o /dev/null -d 'user=gatewaytest&password=secret' "$base/app/login"
+curl -skD "$headers" -c "$cookies" -b "$cookies" -o /dev/null \
+  -d 'user=gatewaytest&password=secret' "$base/app/login"
+grep -q '^HTTP/.* 302 ' "$headers"
+login_location=$(awk 'tolower($1) == "location:" { print $2 }' "$headers" | tr -d '\r')
+assert_equal 'main' "$login_location" 'login redirect'
 curl -skf -c "$cookies" -b "$cookies" -o /dev/null "$base/app/shopping?add=0001"
 curl -skf -c "$cookies" -b "$cookies" -o /dev/null "$base/app/shopping?add=0001"
 curl -skf -c "$cookies" -b "$cookies" "$base/app/cart" | grep -F '53.34' >/dev/null
