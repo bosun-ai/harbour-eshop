@@ -57,6 +57,26 @@ docker run --rm -p 8002:8002 harbour-eshop
 
 Then open <https://localhost:8002> and accept the self-signed certificate.
 
+## Optional Rust ingress gateway
+
+The default command above remains the emergency fallback and publishes Harbour directly. The optional `gateway/` crate introduces a separate public HTTPS listener while preserving Harbour as the private HTTPS upstream and sole application/state owner. Its bootstrap registry is empty, so `GATEWAY_ENABLED_SLICES=` proxies every path unchanged; adding a future handler never selects it.
+
+Build it separately:
+
+```sh
+docker build -t harbour-eshop-gateway gateway
+```
+
+Use `gateway/gateway.env.example` as the required configuration contract. Deployment requires separate containers on a private network: publish only gateway port `8002`, do not publish the legacy container port, and do not share writable volumes (especially `/app`). Deliver the public certificate/key and legacy CA certificate as separate read-only files. The legacy certificate must contain the Docker alias used by `GATEWAY_LEGACY_URL` and match `GATEWAY_UPSTREAM_TLS_SERVER_NAME`; the stock entrypoint's `localhost` certificate cannot validate `https://legacy:8002`.
+
+`scripts/test-gateway-proxy.sh` is the executable local contract. It creates isolated certificates and a Docker network, then compares direct private legacy and public all-proxy responses for `/hello`, `/`, and `/files/main.css`; it also checks registration, session cookies, repeated cart query mutations, and the cart total. Run it after both images are built:
+
+```sh
+LEGACY_IMAGE=harbour-eshop GATEWAY_IMAGE=harbour-eshop-gateway sh scripts/test-gateway-proxy.sh
+```
+
+No gateway health path is reserved in this bootstrap because unknown paths must continue to reach Harbour. Production liveness/readiness probing and certificate delivery are platform inputs that must be supplied by the deployment environment.
+
 ### Try it from the command line
 
 ```sh
@@ -96,8 +116,10 @@ app/                     unmodified upstream sources
 Dockerfile               builds Harbour, compiles eshop, packages the runtime
 docker-entrypoint.sh     creates a self-signed certificate, starts eshop
 .github/workflows/       CI: compiles eshop and checks that the server answers
+gateway/                 isolated Rust public HTTPS ingress and dispatch extension point
+scripts/test-gateway-proxy.sh  two-container all-proxy compatibility contract
 ```
 
 ## CI
 
-[`build.yml`](.github/workflows/build.yml) builds the Docker image, which compiles Harbour and `eshop.prg` with warnings treated as errors (`-w3 -es2`). It then starts the container and checks that `/hello` responds. The code is upstream sample code, so there's no separate test suite.
+[`build.yml`](.github/workflows/build.yml) builds the legacy image, builds the isolated gateway image, retains the direct `/hello` smoke, then runs the two-container all-proxy compatibility contract. The Harbour code remains upstream sample code; focused dispatcher tests live in the gateway crate.

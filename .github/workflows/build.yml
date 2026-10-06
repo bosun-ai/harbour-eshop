@@ -23,6 +23,13 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Build Rust gateway
+        uses: docker/build-push-action@v6
+        with:
+          context: gateway
+          load: true
+          tags: harbour-eshop-gateway:ci
+
       - name: Server starts and answers
         run: |
           docker run -d --name eshop -p 8002:8002 harbour-eshop:ci
@@ -32,3 +39,9 @@ jobs:
           done
           docker logs eshop
           exit 1
+
+      - name: Stop direct legacy smoke container
+        run: docker rm -f eshop
+
+      - name: Gateway proxies the legacy compatibility contract
+        run: LEGACY_IMAGE=harbour-eshop:ci GATEWAY_IMAGE=harbour-eshop-gateway:ci sh scripts/test-gateway-proxy.sh
