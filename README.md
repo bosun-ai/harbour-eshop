@@ -57,6 +57,13 @@ docker run --rm -p 8002:8002 harbour-eshop
 
 Then open <https://localhost:8002> and accept the self-signed certificate.
 
+### Optional HTTPS Gateway
+
+The independent [Rust gateway](gateway/README.md) is an opt-in all-proxy boundary.
+It leaves every application route and data file owned by Harbour. Building it
+does not enable it or change the Docker commands above. Its guide covers verified
+TLS, private networking, retained runtime state, acceptance checks and rollback.
+
 ### Try it from the command line
 
 ```sh
@@ -100,4 +107,4 @@ docker-entrypoint.sh     creates a self-signed certificate, starts eshop
 
 ## CI
 
-[`build.yml`](.github/workflows/build.yml) builds the Docker image, which compiles Harbour and `eshop.prg` with warnings treated as errors (`-w3 -es2`). It then starts the container and checks that `/hello` responds. The code is upstream sample code, so there's no separate test suite.
+[`build.yml`](.github/workflows/build.yml) builds the Docker image, which compiles Harbour and `eshop.prg` with warnings treated as errors (`-w3 -es2`). It then starts the container and checks that `/hello` responds. The upstream application has no separate unit suite. CI additionally builds and verifies the optional gateway with disposable state; this is not production deployment.

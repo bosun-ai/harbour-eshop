@@ -32,3 +32,22 @@ jobs:
           done
           docker logs eshop
           exit 1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Gateway crate checks
+        run: |
+          cargo test --locked --manifest-path gateway/Cargo.toml
+          cargo fmt --check --manifest-path gateway/Cargo.toml
+          cargo clippy --locked --manifest-path gateway/Cargo.toml --all-targets -- -D warnings
+
+      - name: Opt-in gateway acceptance
+        env:
+          LEGACY_IMAGE: harbour-eshop:ci
+        run: sh verification/coverage.sh
+
+      - name: Remove legacy smoke container
+        if: always()
+        run: docker rm -f eshop || true
