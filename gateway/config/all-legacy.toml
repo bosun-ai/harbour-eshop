@@ -1,0 +1,19 @@
+# Example only: mount externally delivered credentials; never activate implicitly.
+public_bind = "0.0.0.0:8002"
+management_bind = "127.0.0.1:8003"
+legacy_upstream = "https://legacy:8002/"
+public_certificate = "/credentials/public.crt"
+public_key = "/credentials/public.key"
+upstream_trust = "/credentials/upstream-ca.crt"
+trusted_proxies = []
+enabled_families = []
+connect_ms = 3000
+header_ms = 10000
+body_idle_ms = 10000
+deadline_ms = 30000
+probe_ms = 3000
+drain_ms = 10000
+max_headers = 100
+max_header_bytes = 32768
+max_connections = 64
+max_body_bytes = 1048576

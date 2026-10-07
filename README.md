@@ -12,7 +12,7 @@ Everything in [`app/`](app/) is copied **unmodified** from the official Harbour 
 - Pinned commit: [`529b0d4`](https://github.com/harbour/core/commit/529b0d42939610a13da1572cd7861da6f9fa2d47)
 - License: Harbour's GPL with the Harbour exception, see [`LICENSE.txt`](LICENSE.txt) (copied from the same commit)
 
-This repository only adds the build and run plumbing: `Dockerfile`, `docker-entrypoint.sh`, and the CI workflow.
+The legacy build and run plumbing remains `Dockerfile` and `docker-entrypoint.sh`. An optional, hosting-only Rust HTTPS ingress lives in `gateway/`; it does not migrate application behavior.
 
 ## What the application does
 
@@ -70,7 +70,13 @@ curl -sk -c $J -b $J $B/app/cart | sed 's/<[^>]*>/ /g' | tr -s ' \n' ' '
 # … Your cart is worth: 53.34 … 0001 Linux in a Nutshell 2 53.34 …
 ```
 
-To look at the data files afterwards, mount a copy of `app/` (for example `-v "$PWD/data:/app"` after copying `app/` into `data/`) or use `docker cp`.
+To look at the data files afterwards, use `docker cp`. A retained `/app` mount must be initialized from the runtime image, including its compiled `eshop` executable; a source-only copy masks that executable. Keep one exclusive Harbour writer per runtime directory.
+
+### Optional HTTPS Ingress
+
+Building or merging the gateway does not start or activate it. Direct Docker commands above remain the default. An explicitly launched gateway forwards every application request to Harbour, with no active Rust family.
+
+See [`docs/gateway-bootstrap.md`](docs/gateway-bootstrap.md) for verified commands, TLS/network/runtime prerequisites, framing limits, activation and current-state rollback. No production certificates or deployment are supplied.
 
 ### Build without Docker
 
@@ -100,4 +106,4 @@ docker-entrypoint.sh     creates a self-signed certificate, starts eshop
 
 ## CI
 
-[`build.yml`](.github/workflows/build.yml) builds the Docker image, which compiles Harbour and `eshop.prg` with warnings treated as errors (`-w3 -es2`). It then starts the container and checks that `/hello` responds. The code is upstream sample code, so there's no separate test suite.
+[`build.yml`](.github/workflows/build.yml) builds the unchanged Harbour image with warnings treated as errors (`-w3 -es2`) and asserts the `/hello` smoke body. The smoke still uses `-k`; separate optional gateway checks validate TLS, compare independent seeded runtimes, exercise transport failures and deployment rollback, and measure gateway execution-counter coverage. CI verifies only; it does not deploy or authorize activation.

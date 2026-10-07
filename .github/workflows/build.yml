@@ -27,8 +27,43 @@ jobs:
         run: |
           docker run -d --name eshop -p 8002:8002 harbour-eshop:ci
           for _ in $(seq 1 30); do
-            curl -skf https://localhost:8002/hello && exit 0
+            if [ "$(curl -skf https://localhost:8002/hello)" = 'Hello!' ]; then exit 0; fi
             sleep 1
           done
           docker logs eshop
           exit 1
+
+      - name: Stop direct smoke instance
+        if: always()
+        run: docker rm -f eshop || true
+
+      - name: Build and check optional gateway
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work rust:1.97.1-bookworm sh -ec '
+            cargo build --locked --release --manifest-path gateway/Cargo.toml
+            cargo test --locked --manifest-path gateway/Cargo.toml
+          '
+          # ubuntu-latest supplies formatting/lint tools; do not install tooling.
+          cargo fmt --manifest-path gateway/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path gateway/Cargo.toml --all-targets -- -D warnings
+          docker build -f gateway/Dockerfile -t harbour-eshop-gateway:ci .
+          sh -n scripts/run-gateway.sh
+
+      - name: Isolated compatibility and transport verification
+        run: |
+          python3 verification/compatibility.py --legacy-image harbour-eshop:ci
+          python3 verification/transport.py
+          python3 verification/deployment.py --legacy-image harbour-eshop:ci --gateway-image harbour-eshop-gateway:ci
+
+      - name: Measured execution-counter coverage
+        run: |
+          mkdir -p /tmp/eshop-cov-baseline /tmp/eshop-cov-tested
+          docker run --rm -v "$PWD:/work" -v /tmp:/profiles -w /work \
+            -e RUSTFLAGS='-C instrument-coverage' rust:1.97.1-bookworm sh -ec '
+              cargo build --locked --manifest-path gateway/Cargo.toml
+              LLVM_PROFILE_FILE="/profiles/eshop-cov-baseline/%p-%m.profraw" gateway/target/debug/eshop-gateway --config /nonexistent || test "$?" = 1
+              LLVM_PROFILE_FILE="/profiles/eshop-cov-tested/%p-%m.profraw" cargo test --locked --manifest-path gateway/Cargo.toml
+            '
+          LLVM_PROFILE_FILE='/tmp/eshop-cov-tested/%p-%m.profraw' python3 verification/transport.py --gateway gateway/target/debug/eshop-gateway
+          LLVM_PROFILE_FILE='/tmp/eshop-cov-tested/%p-%m.profraw' python3 verification/compatibility.py --legacy-image harbour-eshop:ci --gateway gateway/target/debug/eshop-gateway
+          python3 verification/coverage.py --baseline /tmp/eshop-cov-baseline --tested /tmp/eshop-cov-tested
