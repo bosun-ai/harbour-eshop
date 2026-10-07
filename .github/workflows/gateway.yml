@@ -1,0 +1,20 @@
+name: gateway-bootstrap
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust checks
+        working-directory: gateway
+        run: |
+          cargo build --locked
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+      - name: Disposable hosting verification (no deployment)
+        run: ./gateway/scripts/local.sh verify
