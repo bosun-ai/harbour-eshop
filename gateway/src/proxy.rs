@@ -81,6 +81,7 @@ struct TimedBody {
     timer: Pin<Box<Sleep>>,
     deadline: Instant,
     idle: Duration,
+    start_on_poll: bool,
     uploaded: Option<oneshot::Sender<()>>,
     driver: Option<DriverGuard>,
 }
@@ -103,6 +104,7 @@ impl TimedBody {
             )),
             deadline,
             idle,
+            start_on_poll: false,
             uploaded: None,
             driver: None,
         }
@@ -116,6 +118,12 @@ impl HttpBody for TimedBody {
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, ConfigError>>> {
+        if self.start_on_poll {
+            // Upload polling begins only after upstream connection setup.
+            let next = (Instant::now() + self.idle).min(self.deadline);
+            self.timer.as_mut().reset(next);
+            self.start_on_poll = false;
+        }
         if self.timer.as_mut().poll(context).is_ready() {
             return Poll::Ready(Some(Err(
                 "body timeout; delivery outcome may be unknown".into()
@@ -266,6 +274,7 @@ impl LegacyUpstream {
         let (completed, uploaded) = oneshot::channel();
         let request = request.map(|body| {
             let mut body = TimedBody::new(body, idle, deadline);
+            body.start_on_poll = true;
             if body.is_end_stream() {
                 let _ = completed.send(());
             } else {

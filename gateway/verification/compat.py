@@ -238,12 +238,13 @@ docker("rm", "-f", PREFIX + "-failure")
 docker("rm", "-f", PREFIX + "-probe")
 
 # Threaded transport peer: no application behavior or Harbour changes.
-deadline_script = r'''import socket,ssl,time,threading
+deadline_script = r'''import os,socket,ssl,time,threading
 ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain('/app/certificate.crt','/app/private.key')
 def handle(raw):
  c=None
  try:
+  time.sleep(float(os.environ.get('TLS_DELAY','0')))
   c=ctx.wrap_socket(raw,server_side=True); c.settimeout(12); data=b''
   while b'\r\n\r\n' not in data: data+=c.recv(4096)
   headers,body=data.split(b'\r\n\r\n',1); path=headers.split()[1]
@@ -358,6 +359,35 @@ try:
 finally:
     for stream in streams:
         stream.close()
+docker("rm", "-f", PREFIX + "-failure")
+docker("rm", "-f", PREFIX + "-probe")
+
+# Setup may exceed body-idle while remaining within connect and total limits.
+docker("run", "-d", "--name", PREFIX + "-probe", "--network", PREFIX + "-net", "--network-alias", "fault", "-v", PREFIX + "-runtime:/app:ro", "-e", "TLS_DELAY=1.6", "--entrypoint", "python3", "python:3.12-slim", "-c", deadline_script)
+failure_gateway({"GW_LEGACY_URL": "https://fault", "GW_IDLE_SECONDS": "1", "GW_CONNECT_SECONDS": "5", "GW_TOTAL_SECONDS": "8"}, True)
+time.sleep(1)
+assert Browser(18005).request("/hello")[2] == b"Hello!", "delayed TLS setup failed"
+for streaming in (False, True):
+    with TLS.wrap_socket(socket.create_connection(("localhost", 18005)), server_hostname="localhost") as stream:
+        upload_headers(stream, b"/upload")
+        if streaming:
+            for byte in b"abcdef":
+                time.sleep(.55)
+                stream.sendall(bytes([byte]))
+        else:
+            stream.sendall(b"abcdef")
+        response = http.client.HTTPResponse(stream)
+        response.begin()
+        assert response.status == 200 and response.read() == b"abcdef", ("TLS setup consumed upload idle budget", streaming)
+assert docker("logs", PREFIX + "-probe").stdout.count("UPLOAD 6") == 2, "delayed TLS uploads were incomplete"
+with TLS.wrap_socket(socket.create_connection(("localhost", 18005)), server_hostname="localhost") as stream:
+    upload_headers(stream, b"/upload")
+    stream.sendall(b"a")
+    start = time.monotonic()
+    response = http.client.HTTPResponse(stream)
+    response.begin()
+    assert response.status == 502 and 2.2 < time.monotonic() - start < 4.5, "post-setup idle upload not bounded"
+    response.read()
 docker("rm", "-f", PREFIX + "-failure")
 docker("rm", "-f", PREFIX + "-probe")
 

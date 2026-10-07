@@ -90,6 +90,8 @@ exactly `200`/`Hello!`, with no cookies or redirects. `/live` checks the gateway
   `GW_{CONNECT,IDLE,TOTAL,DRAIN}_SECONDS` accepts 1–3600; connect/idle cannot exceed
   total. These are new operational limits, not promises about legacy behavior.
   The initial client headers have a separate idle bound, before exchange timing.
+  Request-body idle timing starts on the first upload poll after upstream setup;
+  connection setup still counts toward the independent total deadline.
   Response-header idle timing starts after upload completion; early upstream
   responses remain supported. Public total and socket-write idle deadlines run
   independently of body polling, also during shutdown drain. Closing an exchange
@@ -161,6 +163,7 @@ framing rejection, invalid config, wrong CA/name, private upstream/no gateway
 cart-mutating GET with exactly one upstream attempt, body-idle truncation,
 SIGTERM draining an active response, and rollback using current runtime volume.
 Review regressions also passed active slow uploads, idle uploads, early responses,
+complete and streaming uploads after TLS setup longer than the body-idle limit,
 post-upload header timeout, active-body total timeout, invalid/omitted upstream
 ports (including a verified 443 connection), a nonreading 64 MiB response client,
 and 256 nonreading clients followed by permit/public/health recovery. Socket state
@@ -183,7 +186,7 @@ Build provenance from this run (locally built images have no registry RepoDigest
 | Rust | 1.97.1, commit `8bab26f4f68e0e26f0bb7960be334d5b520ea452` |
 | Harbour source | `529b0d42939610a13da1572cd7861da6f9fa2d47` (existing Dockerfile) |
 | Legacy image | `sha256:b799038836231ad88ed6a765c498bb32a693797a6b76e06e63145e299bfb09a4` |
-| Gateway image | `sha256:b66d3632d1b3dcd37fa0797d3a1cf32f40b73e977662e50c120899327cbee0d7` |
+| Gateway image | `sha256:1aef68dca5098b352ac08941a2b1398bcc52603ab173c9b38288b665dec6d18a` |
 | Rust base RepoDigest | `rust@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97` |
 | Debian base RepoDigest | `debian@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587` |
 
