@@ -211,7 +211,8 @@ pub async fn serve(config: Arc<Config>, dispatch: Arc<Dispatch>) -> Result<(), E
                         }
                     });
                     let mut builder = hyper::server::conn::http1::Builder::new();
-                    builder.keep_alive(true).max_buf_size(64 * 1024);
+                    // A connection-age bound is safe only for single-request connections.
+                    builder.keep_alive(false).max_buf_size(64 * 1024);
                     let lifetime = config_lifetime;
                     let connection = builder.serve_connection(TokioIo::new(tls), service);
                     tokio::pin!(connection);

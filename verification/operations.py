@@ -112,6 +112,20 @@ def main():
         assert result[0] == 200 and result[2] == b"OK"
         assert len([field for field in result[1] if field[0].lower() == "set-cookie"]) == 2
         assert "x-hop" not in dict(result[1])
+        # Request reuse explicitly; inspect the original TLS socket so the client
+        # cannot silently reconnect and hide a connection-age deadline regression.
+        context = ssl.create_default_context(cafile=str(TMP / "public.crt"))
+        with context.wrap_socket(socket.create_connection(("localhost", public)), server_hostname="localhost") as tls:
+            tls.settimeout(5)
+            tls.sendall(b"GET /hello HTTP/1.1\r\nHost: sensitive-host\r\nConnection: keep-alive\r\n\r\n")
+            response = http.client.HTTPResponse(tls)
+            try:
+                response.begin()
+                assert response.status == 200 and response.read() == b"Hello!"
+                assert response.getheader("Connection", "").lower() == "close"
+            finally:
+                response.close()
+            assert tls.recv(1) == b"", "public connection remained reusable"
         assert request("/mutate?add=0001")[0] == 502
         assert counts["/mutate?add=0001"] == 1
         assert request("/slow")[0] == 504
@@ -160,7 +174,7 @@ def main():
         log.flush()
         content = (TMP / "local.log").read_text()
         assert all(secret not in content for secret in ["secret-cookie", "sensitive-host", "?add=0001"])
-        print("PASS: local entrypoints, config, startup ordering, deadlines, truncation, no GET retries, graceful/forced drain, connection limits")
+        print("PASS: local entrypoints, config, startup ordering, explicit close on reuse, deadlines, truncation, no GET retries, graceful/forced drain, connection limits")
     finally:
         if process.poll() is None:
             process.terminate()

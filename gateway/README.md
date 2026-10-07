@@ -55,10 +55,12 @@ TLS handshakes and upstream drivers have bounded deadlines. Logs contain only
 gateway correlation, owner, method, status, duration and fixed categories. This
 does **not** redact Harbour's existing request/body tracing.
 
-Public connections also have a maximum lifetime of exchange + connect seconds,
-bounding idle clients and blocked downstream writes; reconnecting is required
-after that lifetime. A timeout error response gets a separate connect-sized send
-window. This policy must be checked against actual browser transfer workloads.
+Public HTTP/1 keep-alive is disabled: each response explicitly closes its
+connection, so later requests cannot inherit an older connection's deadline.
+Connections also have a maximum lifetime of exchange + connect seconds,
+bounding idle clients and blocked downstream writes. A timeout error response
+gets a separate connect-sized send window. This policy must be checked against
+actual browser transfer workloads.
 
 Future slices implement `dispatch::Handler`, add one complete `Family`
 registration in the composition root, and require explicit activation. Families
