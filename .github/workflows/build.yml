@@ -39,7 +39,8 @@ jobs:
 
       - name: Build and check optional gateway
         run: |
-          docker run --rm -v "$PWD:/work" -w /work rust:1.97.1-bookworm sh -ec '
+          docker run --rm --user "$(id -u):$(id -g)" -e CARGO_HOME=/tmp/cargo-home \
+            -v "$PWD:/work" -w /work rust:1.97.1-bookworm sh -ec '
             cargo build --locked --release --manifest-path gateway/Cargo.toml
             cargo test --locked --manifest-path gateway/Cargo.toml
           '
@@ -58,7 +59,8 @@ jobs:
       - name: Measured execution-counter coverage
         run: |
           mkdir -p /tmp/eshop-cov-baseline /tmp/eshop-cov-tested
-          docker run --rm -v "$PWD:/work" -v /tmp:/profiles -w /work \
+          docker run --rm --user "$(id -u):$(id -g)" -e CARGO_HOME=/tmp/cargo-home \
+            -v "$PWD:/work" -v /tmp:/profiles -w /work \
             -e RUSTFLAGS='-C instrument-coverage' rust:1.97.1-bookworm sh -ec '
               cargo build --locked --manifest-path gateway/Cargo.toml
               LLVM_PROFILE_FILE="/profiles/eshop-cov-baseline/%p-%m.profraw" gateway/target/debug/eshop-gateway --config /nonexistent || test "$?" = 1

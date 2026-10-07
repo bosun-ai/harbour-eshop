@@ -27,6 +27,7 @@ class Upstream:
         self.listener.settimeout(0.1)
         self.stop = threading.Event()
         self.records = []
+        self.large_closed = threading.Event()
         self.pool = ThreadPoolExecutor(max_workers=16)
         self.thread = threading.Thread(target=self.accept)
         self.thread.start()
@@ -70,6 +71,14 @@ class Upstream:
                     stream.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nprefix")
                     if path == "/slow-body":
                         time.sleep(1)
+                    return
+                if path == "/large":
+                    try:
+                        stream.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 16777216\r\nConnection: close\r\n\r\n")
+                        for _ in range(256):
+                            stream.sendall(b"x" * 65536)
+                    finally:
+                        self.large_closed.set()
                     return
                 body = b"Hello!" if path == "/hello" else body or b"opaque\x00bytes"
                 stream.sendall(b"HTTP/1.1 201 Created\r\n" if path != "/hello" else b"HTTP/1.1 200 OK\r\n")
@@ -172,6 +181,38 @@ def main():
                 for stream in held:
                     stream.close()
             wait(lambda: Client(18443, trust).request("/hello")[0][0] == 200)
+            # A non-reading client must lose its slot without disconnecting.
+            # Exercise absolute expiry and write-idle expiry independently.
+            for deadline_ms, idle_ms in [(300, 2000), (2000, 200)]:
+                slow_config = write_config(directory, 18448, 18008, deadline_ms=deadline_ms,
+                                           body_idle_ms=idle_ms, header_ms=3000, max_connections=1)
+                slow_process = start(slow_config)
+                wait(lambda: management(18008)[0] == 200)
+                upstream.large_closed.clear()
+                slow_socket = socket.socket()
+                slow_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+                slow_socket.settimeout(3)
+                slow_socket.connect(("localhost", 18448))
+                stream = context.wrap_socket(slow_socket, server_hostname="localhost")
+                try:
+                    before = len(upstream.records)
+                    stream.sendall(b"GET /large HTTP/1.1\r\nHost: shop.example\r\n\r\n")
+                    wait(lambda: len(upstream.records) > before, seconds=2)
+                    time.sleep(0.8)
+                    assert Client(18448, trust).request("/hello")[0][0] == 200, "slow reader retained the only slot"
+                    assert upstream.large_closed.wait(0.2), "expired response retained its upstream driver"
+                    # Completed responses must disarm timing on a keep-alive connection.
+                    connection = http.client.HTTPSConnection("localhost", 18448, context=context, timeout=3)
+                    connection.request("GET", "/hello")
+                    assert connection.getresponse().read() == b"Hello!"
+                    time.sleep(0.8)
+                    connection.request("GET", "/hello")
+                    assert connection.getresponse().read() == b"Hello!"
+                    connection.close()
+                finally:
+                    stream.close()
+                    slow_process.terminate()
+                    slow_process.wait(timeout=3)
             # Public SAN and trust are independently validated.
             try:
                 ssl.create_default_context().wrap_socket(socket.create_connection(("localhost", 18443)), server_hostname="localhost")
@@ -217,7 +258,7 @@ def main():
             text = logs.read()
             for secret in ["secret-token", "SESSID", "add=", "raw=", "evil"]:
                 assert secret not in text
-            print("PASS: host/raw URI/bytes, fixed length, cookies, hop fields, zero retries, deadlines, partial streams, cancellation, TLS trust/SAN, invalid activation, bounded drain, redaction")
+            print("PASS: host/raw URI/bytes, fixed length, cookies, hop fields, zero retries, deadlines, non-reading-client slot release (deadline/write-idle), partial streams, cancellation, TLS trust/SAN, invalid activation, bounded drain, redaction")
         finally:
             for process in processes:
                 if process.poll() is None:

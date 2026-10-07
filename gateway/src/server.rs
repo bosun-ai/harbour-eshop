@@ -13,6 +13,7 @@ use hyper::{Request, Response, body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use std::{
     convert::Infallible,
+    io,
     pin::Pin,
     sync::{
         Arc,
@@ -21,8 +22,9 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpListener,
-    sync::Semaphore,
+    sync::{Semaphore, watch},
     task::JoinSet,
     time::{Instant, Sleep, sleep_until, timeout, timeout_at},
 };
@@ -144,6 +146,118 @@ impl HttpBody for GuardedBody {
 
 static IDS: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone)]
+struct ResponseTiming {
+    deadline: Instant,
+    idle_until: Instant,
+    idle_ms: u64,
+    body_done: bool,
+    correlation_id: String,
+}
+
+// Keep timing alive until Hyper has flushed the final bytes, not just read them.
+struct ResponseBody {
+    inner: Body,
+    timing: watch::Sender<Option<ResponseTiming>>,
+}
+impl HttpBody for ResponseBody {
+    type Data = Bytes;
+    type Error = TransportFailure;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, TransportFailure>>> {
+        let result = Pin::new(&mut self.inner).poll_frame(context);
+        if matches!(result, Poll::Ready(None))
+            || self.inner.is_end_stream()
+            || self.inner.size_hint().exact() == Some(0)
+        {
+            self.timing.send_modify(|timing| {
+                if let Some(timing) = timing {
+                    timing.body_done = true;
+                }
+            });
+        }
+        result
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+}
+
+struct ResponseIo<Socket> {
+    inner: Socket,
+    timing: watch::Sender<Option<ResponseTiming>>,
+}
+impl<Socket: AsyncRead + Unpin> AsyncRead for ResponseIo<Socket> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+impl<Socket: AsyncWrite + Unpin> AsyncWrite for ResponseIo<Socket> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(context, bytes);
+        if matches!(result, Poll::Ready(Ok(written)) if written > 0) {
+            self.timing.send_modify(|timing| {
+                if let Some(timing) = timing {
+                    timing.idle_until = Instant::now() + duration(timing.idle_ms);
+                }
+            });
+        }
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let result = Pin::new(&mut self.inner).poll_flush(context);
+        if matches!(result, Poll::Ready(Ok(()))) {
+            self.timing.send_if_modified(|timing| {
+                if timing.as_ref().is_some_and(|timing| timing.body_done) {
+                    *timing = None;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+        result
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
+
+async fn response_expired(mut timing: watch::Receiver<Option<ResponseTiming>>) {
+    loop {
+        let current = timing.borrow_and_update().clone();
+        if let Some(current) = current {
+            tokio::select! {
+                changed = timing.changed() => { if changed.is_err() { return; } }
+                _ = sleep_until(current.deadline.min(current.idle_until)) => {
+                    operations::stream_failure(&current.correlation_id, TransportFailure::Deadline);
+                    return;
+                }
+            }
+        } else if timing.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 /// Validate framing before connecting to Harbour; reject chunked/Expect/upgrade.
 pub fn request_length(request: &Request<Incoming>, config: &Config) -> Result<u64, u16> {
     if request.headers().contains_key("transfer-encoding")
@@ -198,6 +312,7 @@ async fn serve_request(
     config: Arc<Config>,
     registry: Arc<DispatchRegistry>,
     cancellation: CancellationToken,
+    timing: watch::Sender<Option<ResponseTiming>>,
 ) -> Result<Response<Body>, Infallible> {
     let started = Instant::now();
     let id = format!(
@@ -284,7 +399,8 @@ async fn serve_request(
     );
     let method = request.method().as_str().to_owned();
     let (owner, handler) = registry.select(request.uri().path(), request.method());
-    let result = timeout_at(context.deadline, handler.handle(request, context)).await;
+    let deadline = context.deadline;
+    let result = timeout_at(deadline, handler.handle(request, context)).await;
     let (response, error) = match result {
         Ok(Ok(response)) => (response, None),
         Ok(Err(TransportFailure::Deadline)) | Err(_) => (
@@ -304,7 +420,30 @@ async fn serve_request(
         started,
         error,
     );
-    Ok(response)
+    let (parts, body) = response.into_parts();
+    timing.send_replace(Some(ResponseTiming {
+        deadline: if error.is_none() {
+            deadline
+        } else {
+            Instant::now() + duration(config.body_idle_ms)
+        },
+        idle_until: Instant::now() + duration(config.body_idle_ms),
+        idle_ms: config.body_idle_ms,
+        body_done: body.is_end_stream()
+            || body.size_hint().exact() == Some(0)
+            || method == "HEAD"
+            || parts.status == hyper::StatusCode::NO_CONTENT
+            || parts.status == hyper::StatusCode::NOT_MODIFIED,
+        correlation_id: id,
+    }));
+    Ok(Response::from_parts(
+        parts,
+        ResponseBody {
+            inner: body,
+            timing,
+        }
+        .boxed_unsync(),
+    ))
 }
 
 /// Bind both listeners, bound connections (including TLS), and drain on SIGTERM.
@@ -344,14 +483,22 @@ pub async fn run(
                     let header_ms = config.header_ms;
                     let max_headers = config.max_headers;
                     let max_header_bytes = config.max_header_bytes;
-                    let service = service_fn(move |request| serve_request(request, peer, config.clone(), registry.clone(), token.clone()));
+                    let (timing, expiry) = watch::channel(None);
+                    let socket = ResponseIo { inner: socket, timing: timing.clone() };
+                    let service = service_fn(move |request| serve_request(request, peer, config.clone(), registry.clone(), token.clone(), timing.clone()));
                     let mut builder = hyper::server::conn::http1::Builder::new();
                     builder.timer(TokioTimer::new()).header_read_timeout(duration(header_ms))
                         .max_headers(max_headers).max_buf_size(max_header_bytes);
                     let connection = builder.serve_connection(TokioIo::new(socket), service);
                     tokio::pin!(connection);
-                    tokio::select! { _ = &mut connection => {}, _ = shutdown.cancelled() => { connection.as_mut().graceful_shutdown(); let _ = connection.await; } }
+                    tokio::select! {
+                        _ = response_expired(expiry) => {},
+                        _ = async {
+                            tokio::select! { _ = &mut connection => {}, _ = shutdown.cancelled() => { connection.as_mut().graceful_shutdown(); let _ = connection.await; } }
+                        } => {},
+                    }
                     cancellation.cancel();
+                    // Connection drop also releases the response's upstream driver.
                 });
             },
             accepted = management.accept() => {
