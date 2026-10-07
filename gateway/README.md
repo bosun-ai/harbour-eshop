@@ -86,10 +86,15 @@ exactly `200`/`Hello!`, with no cookies or redirects. `/live` checks the gateway
   exchange and cap concurrent public/operations connections together at 256.
   Over-cap connections close rather than queue indefinitely.
 - Defaults: 5 seconds connect/TLS; 30 seconds initial headers, upstream response
-  headers and per-body idle; 120 seconds total upstream exchange; 30 seconds drain.
+  headers and per-body/downstream-write idle; 120 seconds total exchange; 30 seconds drain.
   `GW_{CONNECT,IDLE,TOTAL,DRAIN}_SECONDS` accepts 1–3600; connect/idle cannot exceed
   total. These are new operational limits, not promises about legacy behavior.
   The initial client headers have a separate idle bound, before exchange timing.
+  Response-header idle timing starts after upload completion; early upstream
+  responses remain supported. Public total and socket-write idle deadlines run
+  independently of body polling, also during shutdown drain. Closing an exchange
+  cancels its upstream driver. Explicit upstream ports must parse as u16; only an
+  omitted port defaults to 443.
 - SIGTERM/SIGINT closes listeners, signals active connections to finish, then
   aborts remaining tasks at the drain limit. Rust never writes a Harbour stop file.
 - Gateway-generated errors say delivery outcome may be unknown. An error after
@@ -135,7 +140,7 @@ failed gateway, and mutable Rust data ownership rollback is outside this slice.
 
 ## Verification Results And Gaps
 
-Local verification passed Rust build/format/clippy (`-D warnings`), three focused
+Local verification passed Rust build/format/clippy (`-D warnings`), five focused
 unit tests, both actual Docker builds, `verify`, `up`, `down`, source `serve` and
 SIGTERM. The additive CI invokes the same checks without activation/deployment.
 The legacy smoke workflow remains unchanged.
@@ -155,6 +160,11 @@ framing rejection, invalid config, wrong CA/name, private upstream/no gateway
 `/app` mount, readiness failure with live gateway on outage, dropped/stalled
 cart-mutating GET with exactly one upstream attempt, body-idle truncation,
 SIGTERM draining an active response, and rollback using current runtime volume.
+Review regressions also passed active slow uploads, idle uploads, early responses,
+post-upload header timeout, active-body total timeout, invalid/omitted upstream
+ports (including a verified 443 connection), a nonreading 64 MiB response client,
+and 256 nonreading clients followed by permit/public/health recovery. Socket state
+and upstream closures are checked without draining those clients' response data.
 Containers, network, volumes and scratch certificates were removed afterward.
 
 Coverage-instrumented Rust tests ran and generated differing profiles from the
@@ -173,7 +183,7 @@ Build provenance from this run (locally built images have no registry RepoDigest
 | Rust | 1.97.1, commit `8bab26f4f68e0e26f0bb7960be334d5b520ea452` |
 | Harbour source | `529b0d42939610a13da1572cd7861da6f9fa2d47` (existing Dockerfile) |
 | Legacy image | `sha256:b799038836231ad88ed6a765c498bb32a693797a6b76e06e63145e299bfb09a4` |
-| Gateway image | `sha256:50e4cbe2c042990c32b1f1080d7e6fa469b9b7a850904685cbc4859a8130378e` |
+| Gateway image | `sha256:b66d3632d1b3dcd37fa0797d3a1cf32f40b73e977662e50c120899327cbee0d7` |
 | Rust base RepoDigest | `rust@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97` |
 | Debian base RepoDigest | `debian@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587` |
 

@@ -20,6 +20,14 @@ struct PrefixedIo<T> {
     inner: T,
 }
 
+// Observe actual socket progress, not bytes accepted into rustls's buffers.
+struct DeadlineIo<T> {
+    inner: T,
+    write_deadline: watch::Sender<Option<tokio::time::Instant>>,
+    idle: std::time::Duration,
+    blocked_write: bool,
+}
+
 impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PrefixedIo<T> {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
@@ -31,6 +39,16 @@ impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PrefixedIo<T> {
         } else {
             std::pin::Pin::new(&mut self.inner).poll_read(context, buffer)
         }
+    }
+}
+
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for DeadlineIo<T> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(context, buffer)
     }
 }
 
@@ -53,6 +71,63 @@ impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for PrefixedIo<T> {
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for DeadlineIo<T> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let result = std::pin::Pin::new(&mut self.inner).poll_write(context, bytes);
+        self.blocked_write = result.is_pending();
+        self.track_write(
+            &result,
+            matches!(result, std::task::Poll::Ready(Ok(count)) if count > 0),
+        );
+        result
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let result = std::pin::Pin::new(&mut self.inner).poll_flush(context);
+        self.track_write(&result, result.is_ready() && !self.blocked_write);
+        result
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
+
+impl<T> DeadlineIo<T> {
+    fn track_write<R>(&self, result: &std::task::Poll<R>, progress: bool) {
+        if progress {
+            self.write_deadline.send_replace(None);
+        } else if result.is_pending() && self.write_deadline.borrow().is_none() {
+            self.write_deadline
+                .send_replace(Some(tokio::time::Instant::now() + self.idle));
+        }
+    }
+}
+
+// Runs independently of Hyper's body polling, including blocked TLS flushes.
+async fn write_expired(mut deadline: watch::Receiver<Option<tokio::time::Instant>>) {
+    loop {
+        let current = *deadline.borrow_and_update();
+        tokio::select! {
+            _ = async {
+                match current {
+                    Some(current) => tokio::time::sleep_until(current).await,
+                    None => std::future::pending().await,
+                }
+            } => return,
+            result = deadline.changed() => if result.is_err() { return; },
+        }
     }
 }
 
@@ -118,15 +193,19 @@ pub async fn serve(config: Arc<Config>) -> Result<(), ConfigError> {
                 let mut stopped = shutdown.subscribe();
                 tasks.spawn(async move {
                     let _permit = permit;
+                    let idle = legacy.config.idle;
+                    let total = legacy.config.total;
+                    let (write_deadline, writes) = watch::channel(None);
+                    let tcp = DeadlineIo { inner: tcp, write_deadline, idle, blocked_write: false };
                     let tls = tokio::select! {
                         _ = stopped.changed() => return,
                         result = tokio::time::timeout(legacy.config.connect, acceptor.accept(tcp)) => match result { Ok(Ok(tls)) => tls, _ => return },
                     };
-                    let idle = legacy.config.idle;
                     let tls = tokio::select! {
                         _ = stopped.changed() => return,
                         result = tokio::time::timeout(idle, inspect_headers(tls)) => match result { Ok(Ok(stream)) => stream, _ => return },
                     };
+                    let expires = tokio::time::Instant::now() + total;
                     let service = service_fn(move |request| {
                         let legacy = legacy.clone();
                         async move {
@@ -148,11 +227,19 @@ pub async fn serve(config: Arc<Config>) -> Result<(), ConfigError> {
                     builder.timer(TokioTimer::new()).header_read_timeout(idle).keep_alive(false).max_buf_size(32768);
                     let connection = builder.serve_connection(TokioIo::new(tls), service);
                     tokio::pin!(connection);
+                    let write_timeout = write_expired(writes);
+                    tokio::pin!(write_timeout);
                     tokio::select! {
                         _ = &mut connection => {},
+                        _ = tokio::time::sleep_until(expires) => {},
+                        _ = &mut write_timeout => {},
                         _ = stopped.changed() => {
                             connection.as_mut().graceful_shutdown();
-                            let _ = connection.await;
+                            tokio::select! {
+                                _ = &mut connection => {},
+                                _ = tokio::time::sleep_until(expires) => {},
+                                _ = &mut write_timeout => {},
+                            }
                         }
                     }
                 });

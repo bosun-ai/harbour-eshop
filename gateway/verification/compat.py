@@ -175,6 +175,8 @@ def failure_gateway(overrides, detached=False):
 
 
 for overrides in [{"GW_ACTIVE_FAMILIES": "cart"}, {"GW_LEGACY_URL": "http://legacy:8002"},
+                  {"GW_LEGACY_URL": "https://legacy:99999"},
+                  {"GW_LEGACY_URL": "https://legacy:"},
                   {"GW_IDLE_SECONDS": "0"}, {"GW_OPS_BIND": "0.0.0.0:9000"},
                   {"GW_TLS_KEY": "/certs/ca.crt"}]:
     assert failure_gateway(overrides).returncode != 0, "invalid config accepted"
@@ -235,6 +237,130 @@ assert json.loads(docker("inspect", PREFIX + "-failure").stdout)[0]["State"]["Ex
 docker("rm", "-f", PREFIX + "-failure")
 docker("rm", "-f", PREFIX + "-probe")
 
+# Threaded transport peer: no application behavior or Harbour changes.
+deadline_script = r'''import socket,ssl,time,threading
+ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain('/app/certificate.crt','/app/private.key')
+def handle(raw):
+ c=None
+ try:
+  c=ctx.wrap_socket(raw,server_side=True); c.settimeout(12); data=b''
+  while b'\r\n\r\n' not in data: data+=c.recv(4096)
+  headers,body=data.split(b'\r\n\r\n',1); path=headers.split()[1]
+  if path==b'/large':
+   c.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 67108864\r\n\r\n')
+   for _ in range(1024): c.sendall(b'x'*65536)
+  elif path==b'/total':
+   c.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n')
+   for _ in range(100): c.sendall(b'x'); time.sleep(.4)
+  elif path==b'/early':
+   c.sendall(b'HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\n\r\n')
+  else:
+   length=next((int(line.split(b':',1)[1]) for line in headers.split(b'\r\n') if line.lower().startswith(b'content-length:')),0)
+   while len(body)<length:
+    chunk=c.recv(4096)
+    if not chunk: break
+    body+=chunk
+   if path==b'/upload': print('UPLOAD',len(body),flush=True)
+   if path==b'/headers': time.sleep(4)
+   result=b'Hello!' if path==b'/hello' else body
+   c.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: '+str(len(result)).encode()+b'\r\n\r\n'+result)
+ except (OSError,ssl.SSLError): pass
+ finally:
+  if c: c.close()
+  else: raw.close()
+  print('CLOSED',flush=True)
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(('0.0.0.0',443)); s.listen(512)
+while True: threading.Thread(target=handle,args=(s.accept()[0],),daemon=True).start()
+'''
+docker("run", "-d", "--name", PREFIX + "-probe", "--network", PREFIX + "-net", "--network-alias", "fault", "-v", PREFIX + "-runtime:/app:ro", "--entrypoint", "python3", "python:3.12-slim", "-c", deadline_script)
+# Omitted upstream port must actually use 443, not merely parse successfully.
+failure_gateway({"GW_LEGACY_URL": "https://fault", "GW_IDLE_SECONDS": "2", "GW_CONNECT_SECONDS": "2", "GW_TOTAL_SECONDS": "8"}, True)
+time.sleep(1)
+assert docker("exec", PREFIX + "-failure", "eshop-gateway", "check-ready").returncode == 0
+
+def upload_headers(stream, path):
+    stream.sendall(b"POST " + path + b" HTTP/1.1\r\nHost: localhost\r\nContent-Length: 6\r\nConnection: close\r\n\r\n")
+
+with TLS.wrap_socket(socket.create_connection(("localhost", 18005)), server_hostname="localhost") as stream:
+    upload_headers(stream, b"/upload")
+    for byte in b"abcdef":
+        time.sleep(.55)
+        stream.sendall(bytes([byte]))
+    response = http.client.HTTPResponse(stream)
+    response.begin()
+    assert response.status == 200 and response.read() == b"abcdef", "active upload was cut short"
+assert "UPLOAD 6" in docker("logs", PREFIX + "-probe").stdout
+with TLS.wrap_socket(socket.create_connection(("localhost", 18005)), server_hostname="localhost") as stream:
+    upload_headers(stream, b"/upload")
+    stream.sendall(b"a")
+    start = time.monotonic()
+    response = http.client.HTTPResponse(stream)
+    response.begin()
+    assert response.status == 502 and time.monotonic() - start < 4, "idle upload not bounded"
+    response.read()
+with TLS.wrap_socket(socket.create_connection(("localhost", 18005)), server_hostname="localhost") as stream:
+    upload_headers(stream, b"/early")
+    response = http.client.HTTPResponse(stream)
+    response.begin()
+    assert response.status == 413, "early response waited for upload"
+start = time.monotonic()
+assert Browser(18005).request("/headers")[0] == 502
+assert time.monotonic() - start < 4, "response-header idle timeout missing"
+
+# Body progress must not extend the independent total connection deadline.
+start = time.monotonic()
+try:
+    Browser(18005).request("/total")
+    raise AssertionError("total deadline did not truncate active response")
+except http.client.IncompleteRead:
+    assert 6 < time.monotonic() - start < 10
+time.sleep(1)
+
+# Never read the large response. All 256 public permits must recover, including
+# the shared operations capacity; inspect sockets without draining client output.
+from concurrent.futures import ThreadPoolExecutor
+
+def stalled_reader(_):
+    raw = socket.socket()
+    raw.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    raw.settimeout(10)
+    raw.connect(("localhost", 18005))
+    stream = TLS.wrap_socket(raw, server_hostname="localhost")
+    stream.sendall(b"GET /large HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+    return stream
+
+closed_before = docker("logs", PREFIX + "-probe").stdout.count("CLOSED")
+single = stalled_reader(0)
+try:
+    time.sleep(5)
+    assert docker("logs", PREFIX + "-probe").stdout.count("CLOSED") - closed_before == 1, "single stalled reader exceeded write-idle bound"
+finally:
+    single.close()
+closed_before = docker("logs", PREFIX + "-probe").stdout.count("CLOSED")
+streams = []
+try:
+    start = time.monotonic()
+    with ThreadPoolExecutor(max_workers=256) as pool:
+        streams = list(pool.map(stalled_reader, range(256)))
+    time.sleep(11)
+    # Linux state 01 is ESTABLISHED; port 8002 is 1F42. FIN_WAIT sockets may
+    # retain queued bytes but must no longer own a gateway task/permit.
+    sockets = docker("exec", PREFIX + "-failure", "cat", "/proc/net/tcp").stdout
+    established = [line for line in sockets.splitlines()[1:] if line.split()[1].endswith(":1F42") and line.split()[3] == "01"]
+    assert not established, ("stalled public connections still established", len(established), established[:3], time.monotonic() - start, docker("logs", PREFIX + "-probe").stdout.count("CLOSED") - closed_before)
+    assert docker("logs", PREFIX + "-probe").stdout.count("CLOSED") - closed_before == 256, "upstream drivers were not all cancelled"
+    assert docker("exec", PREFIX + "-failure", "eshop-gateway", "check-ready").returncode == 0, "permits/readiness did not recover"
+    live = docker("run", "--rm", "--network", "container:" + PREFIX + "-failure", "--entrypoint", "python3", "python:3.12-slim", "-c", 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:9000/live").status)').stdout
+    assert live.strip() == "200", "health capacity did not recover"
+    assert Browser(18005).request("/hello")[2] == b"Hello!", "public capacity did not recover"
+finally:
+    for stream in streams:
+        stream.close()
+docker("rm", "-f", PREFIX + "-failure")
+docker("rm", "-f", PREFIX + "-probe")
+
 # Ambiguous framing must never reach a Harbour application handler.
 with TLS.wrap_socket(socket.create_connection(("localhost", 18002)), server_hostname="localhost") as stream:
     stream.sendall(b"POST /app/register HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n")
@@ -265,4 +391,4 @@ wait(rollback)
 rollback.request("/app/login", "POST", {"user": "bootstrap", "password": "testpass"})
 assert b"Retained" in rollback.request("/app/account")[2]
 assert b"26.67" in rollback.request("/app/cart")[2]
-print("PASS: HTTP/stateful compatibility, chunking, sessions, isolation, TLS/config failures, one-attempt faults, outage, lifecycle, retained-data rollback")
+print("PASS: HTTP/stateful compatibility, chunking, sessions, isolation, TLS/config/port failures, upload/header/total/write-idle deadlines, 256 stalled-reader permits and health recovery, upstream cancellation, one-attempt faults, outage, lifecycle, retained-data rollback")

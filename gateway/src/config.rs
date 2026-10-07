@@ -35,7 +35,31 @@ pub fn origin(value: &str) -> Result<Uri, ConfigError> {
     {
         return Err("legacy URL must be a fixed HTTPS origin".into());
     }
+    upstream_port(&uri)?;
     Ok(uri)
+}
+
+/// Default only an omitted port; Hyper's port_u16 also returns None for invalid ports.
+pub fn upstream_port(uri: &Uri) -> Result<u16, ConfigError> {
+    let authority = uri
+        .authority()
+        .ok_or("missing upstream authority")?
+        .as_str();
+    let suffix = if authority.starts_with('[') {
+        authority.split_once(']').ok_or("invalid upstream host")?.1
+    } else {
+        authority
+            .strip_prefix(uri.host().ok_or("missing upstream host")?)
+            .unwrap_or("")
+    };
+    if suffix.is_empty() {
+        Ok(443)
+    } else {
+        Ok(suffix
+            .strip_prefix(':')
+            .ok_or("invalid upstream port")?
+            .parse::<u16>()?)
+    }
 }
 
 fn duration(name: &str, default: u64) -> Result<Duration, ConfigError> {
@@ -118,6 +142,34 @@ mod tests {
             "https://legacy/#x",
         ] {
             assert!(origin(value).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_ports_must_be_valid() {
+        for value in [
+            "https://legacy:99999",
+            "https://legacy:65536",
+            "https://legacy:",
+            "https://legacy:abc",
+            "https://[::1]:99999",
+        ] {
+            assert!(origin(value).is_err(), "accepted {value}");
+        }
+        assert_eq!(
+            upstream_port(&origin("https://legacy:8002").unwrap()).unwrap(),
+            8002
+        );
+        assert_eq!(
+            upstream_port(&origin("https://legacy:65535").unwrap()).unwrap(),
+            65535
+        );
+    }
+
+    #[test]
+    fn omitted_ports_default_to_https() {
+        for value in ["https://legacy", "https://[::1]"] {
+            assert_eq!(upstream_port(&origin(value).unwrap()).unwrap(), 443);
         }
     }
 }

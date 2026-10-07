@@ -1,4 +1,4 @@
-use crate::config::{Config, ConfigError};
+use crate::config::{Config, ConfigError, upstream_port};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::{
@@ -16,6 +16,7 @@ use std::{
 };
 use tokio::{
     net::TcpStream,
+    sync::oneshot,
     time::{Instant, Sleep, timeout},
 };
 use tokio_rustls::TlsConnector;
@@ -80,6 +81,17 @@ struct TimedBody {
     timer: Pin<Box<Sleep>>,
     deadline: Instant,
     idle: Duration,
+    uploaded: Option<oneshot::Sender<()>>,
+    driver: Option<DriverGuard>,
+}
+
+// Dropping a service future or response body must not leave its upstream task alive.
+struct DriverGuard(tokio::task::AbortHandle);
+
+impl Drop for DriverGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl TimedBody {
@@ -91,6 +103,8 @@ impl TimedBody {
             )),
             deadline,
             idle,
+            uploaded: None,
+            driver: None,
         }
     }
 }
@@ -109,11 +123,22 @@ impl HttpBody for TimedBody {
         }
         match Pin::new(&mut self.inner).poll_frame(context) {
             Poll::Ready(Some(Ok(frame))) => {
+                if self.inner.is_end_stream()
+                    && let Some(uploaded) = self.uploaded.take()
+                {
+                    let _ = uploaded.send(());
+                }
                 let next = (Instant::now() + self.idle).min(self.deadline);
                 self.timer.as_mut().reset(next);
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(_))) => Poll::Ready(Some(Err("body transport error".into()))),
+            Poll::Ready(None) => {
+                if let Some(uploaded) = self.uploaded.take() {
+                    let _ = uploaded.send(());
+                }
+                Poll::Ready(None)
+            }
             other => other.map(|frame| {
                 frame.map(|result| result.map_err(|error| Box::new(error) as ConfigError))
             }),
@@ -138,12 +163,13 @@ impl LegacyUpstream {
         &self,
         request: Request<Body>,
         deadline: Instant,
+        uploaded: Option<oneshot::Receiver<()>>,
     ) -> Result<Response<Body>, ProxyError> {
         let config = &self.config;
         let connect = async {
             let tcp = TcpStream::connect((
                 config.upstream.host().unwrap(),
-                config.upstream.port_u16().unwrap_or(443),
+                upstream_port(&config.upstream).map_err(|_| ProxyError::Upstream)?,
             ))
             .await
             .map_err(|_| ProxyError::Upstream)?;
@@ -161,18 +187,38 @@ impl LegacyUpstream {
             .await
             .map_err(|_| ProxyError::Upstream)?;
         let idle = config.idle;
-        tokio::spawn(async move {
+        let driver = tokio::spawn(async move {
             let _ = tokio::time::timeout_at(deadline, connection).await;
         });
-        let mut response = tokio::time::timeout_at(
-            (Instant::now() + idle).min(deadline),
-            sender.send_request(request),
-        )
-        .await
-        .map_err(|_| ProxyError::Timeout)?
-        .map_err(|_| ProxyError::Upstream)?;
+        let driver = DriverGuard(driver.abort_handle());
+        let headers = async {
+            let response = sender.send_request(request);
+            tokio::pin!(response);
+            let upload = async {
+                if let Some(uploaded) = uploaded {
+                    uploaded.await.map_err(|_| ProxyError::Upstream)?;
+                }
+                Ok::<_, ProxyError>(())
+            };
+            // Early responses remain supported, even while an upload is in progress.
+            tokio::select! {
+                result = &mut response => result.map_err(|_| ProxyError::Upstream),
+                result = upload => {
+                    result?;
+                    timeout(idle, response).await.map_err(|_| ProxyError::Timeout)?
+                        .map_err(|_| ProxyError::Upstream)
+                }
+            }
+        };
+        let mut response = tokio::time::timeout_at(deadline, headers)
+            .await
+            .map_err(|_| ProxyError::Timeout)??;
         strip_hop(response.headers_mut());
-        Ok(response.map(|body| TimedBody::new(body, idle, deadline).boxed_unsync()))
+        Ok(response.map(|body| {
+            let mut body = TimedBody::new(body, idle, deadline);
+            body.driver = Some(driver);
+            body.boxed_unsync()
+        }))
     }
 
     pub async fn forward(
@@ -217,11 +263,19 @@ impl LegacyUpstream {
         }
         let deadline = Instant::now() + self.config.total;
         let idle = self.config.idle;
-        self.exchange(
-            request.map(|body| TimedBody::new(body, idle, deadline).boxed_unsync()),
-            deadline,
-        )
-        .await
+        let (completed, uploaded) = oneshot::channel();
+        let request = request.map(|body| {
+            let mut body = TimedBody::new(body, idle, deadline);
+            if body.is_end_stream() {
+                let _ = completed.send(());
+            } else {
+                body.uploaded = Some(completed);
+            }
+            body.boxed_unsync()
+        });
+        tokio::time::timeout_at(deadline, self.exchange(request, deadline, Some(uploaded)))
+            .await
+            .map_err(|_| ProxyError::Timeout)?
     }
 
     pub async fn check_legacy(&self) -> bool {
@@ -236,7 +290,7 @@ impl LegacyUpstream {
             .unwrap();
         let probe = async {
             let response = self
-                .exchange(request, Instant::now() + self.config.connect)
+                .exchange(request, Instant::now() + self.config.connect, None)
                 .await
                 .ok()?;
             if response.status() != StatusCode::OK {
