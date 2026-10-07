@@ -47,7 +47,7 @@ def main():
         helper = f"eshop-fixtures-{os.getpid()}"
         command("docker", "run", "-d", "--name", helper, "--mount", "type=bind,src=/tmp,dst=/daemon-tmp",
                 "--entrypoint", "sleep", legacy_id, "300")
-        command("docker", "cp", str(directory), helper + ":/daemon-tmp/")
+        command("docker", "cp", "-a", str(directory), helper + ":/daemon-tmp/")
         log = open(directory / "launcher.log", "w+")
         process = subprocess.Popen([str(launcher), "--activate", legacy_id, gateway_id,
                                     str(config), str(credentials), str(runtime)], stdout=log, stderr=log)
