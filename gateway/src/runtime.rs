@@ -2,7 +2,7 @@
 use crate::{
     config::{ValidatedConfig, milliseconds},
     dispatch::DispatchTable,
-    legacy::LegacyUpstream,
+    legacy::{LegacyUpstream, ResponseDeadline},
     response, slices,
 };
 use http_body_util::BodyExt;
@@ -62,8 +62,10 @@ pub async fn run(config: ValidatedConfig) -> Result<(), &'static str> {
                     let tls = match timeout(milliseconds(config.settings.connect_timeout_ms), acceptor.accept(socket)).await {
                         Ok(Ok(tls)) => tls, _ => return,
                     };
+                    let (deadline_tx, mut deadline_rx) = watch::channel(None);
                     let service = service_fn(move |request: Request<Incoming>| {
                         let (upstream, dispatch) = (upstream.clone(), dispatch.clone());
+                        let deadline_tx = deadline_tx.clone();
                         let id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
                         async move {
                             let start = Instant::now();
@@ -76,6 +78,9 @@ pub async fn run(config: ValidatedConfig) -> Result<(), &'static str> {
                             let (route, result) = if let Some((family, handler)) = selection {
                                 (family.to_owned(), handler.handle(request.map(|body| body.map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>).boxed_unsync())).await)
                             } else { ("legacy".to_owned(), upstream.forward(request, peer.ip()).await) };
+                            if let Some(deadline) = result.extensions().get::<ResponseDeadline>() {
+                                let _ = deadline_tx.send(Some(deadline.0));
+                            }
                             tracing::info!(request_id = id, method, route, status = result.status().as_u16(), duration_ms = start.elapsed().as_millis() as u64);
                             Ok::<_, Infallible>(result)
                         }
@@ -85,9 +90,29 @@ pub async fn run(config: ValidatedConfig) -> Result<(), &'static str> {
                         .max_buf_size(32768).keep_alive(false);
                     let connection = builder.serve_connection(TokioIo::new(tls), service);
                     tokio::pin!(connection);
-                    tokio::select! { _ = &mut connection => {}, _ = shutdown.changed() => {
-                        connection.as_mut().graceful_shutdown(); let _ = connection.await;
-                    }}
+                    let response_expired = async move {
+                        while deadline_rx.changed().await.is_ok() {
+                            let deadline = *deadline_rx.borrow_and_update();
+                            if let Some(deadline) = deadline {
+                                tokio::time::sleep_until(deadline).await;
+                                return;
+                            }
+                        }
+                        std::future::pending::<()>().await;
+                    };
+                    tokio::pin!(response_expired);
+                    let mut draining = false;
+                    loop {
+                        tokio::select! {
+                            _ = &mut connection => break,
+                            // Drop the connection, response body/driver and permit even if writes stall.
+                            _ = &mut response_expired => break,
+                            _ = shutdown.changed(), if !draining => {
+                                draining = true;
+                                connection.as_mut().graceful_shutdown();
+                            }
+                        }
+                    }
                 });
             },
             accepted = management.accept() => {

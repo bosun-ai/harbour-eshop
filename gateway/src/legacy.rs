@@ -28,6 +28,10 @@ impl Drop for Driver {
     }
 }
 
+// Shared with the public connection so downstream backpressure cannot pause expiry.
+#[derive(Clone, Copy)]
+pub(crate) struct ResponseDeadline(pub Instant);
+
 /// Bound body idle time and total response time. Dropping the body cancels upstream IO.
 fn bounded_body(
     body: Incoming,
@@ -210,6 +214,7 @@ impl LegacyUpstream {
         match tokio::time::timeout_at(deadline, sender.send_request(request)).await {
             Ok(Ok(mut result)) => {
                 strip_hop_headers(result.headers_mut());
+                result.extensions_mut().insert(ResponseDeadline(deadline));
                 let (parts, body) = result.into_parts();
                 Response::from_parts(
                     parts,

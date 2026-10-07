@@ -183,6 +183,50 @@ def raw_request(data):
             result += part
 
 
+def verify_backpressure(binary, directory, key, cert, upstream_key, upstream_cert, drain=False):
+    """Response expiry must cancel upstream and free a permit without client reads."""
+    upstream = SyntheticUpstream(upstream_key, upstream_cert)
+    settings = configuration(key, cert, upstream_cert, f"https://localhost:{upstream.port}")
+    # Other connections must retain their permits until after the response deadline.
+    settings = settings.replace('connect_timeout_ms = 300', 'connect_timeout_ms = 5000')
+    settings = settings.replace('shutdown_drain_ms = 1000', 'shutdown_drain_ms = 3000')
+    gateway = Gateway(binary, directory, settings)
+    sockets = []
+    try:
+        wait_for(lambda: request(9000, "/live", secure=False)[0] == 200)
+        upstream.mode = "endless"
+        raw = socket.socket()
+        sockets.append(raw)
+        raw.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+        raw.settimeout(2)
+        raw.connect(("localhost", 8002))
+        stalled = ssl._create_unverified_context().wrap_socket(raw, server_hostname="localhost")
+        sockets[0] = stalled
+        for _ in range(127):
+            sockets.append(socket.create_connection(("localhost", 8002), 2))
+        time.sleep(0.1)
+        with socket.create_connection(("localhost", 8002), 2) as excess:
+            excess.settimeout(2)
+            assert excess.recv(1) == b""  # all 128 permits are occupied
+        started = time.monotonic()
+        stalled.sendall(b"GET /no-read HTTP/1.1\r\nHost: public\r\n\r\n")
+        wait_for(lambda: bool(upstream.requests), seconds=1)
+        if drain:
+            gateway.process.send_signal(signal.SIGTERM)
+        # Never read or close stalled: Hyper must fill its write buffers and block.
+        assert upstream.cancelled.wait(1.5), "response deadline did not cancel upstream"
+        assert time.monotonic() - started < 1.7
+        upstream.mode = "normal"
+        if not drain:
+            assert request(8002)[0] == 200  # expiry, not client close, released a permit
+            assert request(9000, "/live", secure=False)[0] == 200
+    finally:
+        for connection in sockets:
+            connection.close()
+        gateway.close()
+        upstream.close()
+
+
 def verify_transport(binary, directory):
     key, cert = certificate(directory, "public", "DNS:localhost")
     upstream_key, upstream_cert = certificate(directory, "upstream", "DNS:localhost")
@@ -307,6 +351,8 @@ def verify_transport(binary, directory):
         assert request(8002)[0] == 502
     finally:
         gateway.close()
+    verify_backpressure(binary, directory, key, cert, upstream_key, upstream_cert)
+    verify_backpressure(binary, directory, key, cert, upstream_key, upstream_cert, drain=True)
     fake = SyntheticUpstream(upstream_key, upstream_cert)
     settings = configuration(key, cert, upstream_cert, f"https://localhost:{fake.port}")
     settings = settings.replace('trusted_proxy_cidrs = []', 'trusted_proxy_cidrs = ["127.0.0.0/8"]')

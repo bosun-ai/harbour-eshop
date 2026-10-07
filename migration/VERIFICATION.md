@@ -61,6 +61,18 @@ runtime retention, read-only gateway inputs and exclusive-writer checks were
 executed using that mode. This is not an unverified bind-path deployment claim.
 Temporary test containers, networks and volumes are cleaned by the harness.
 
+### Backpressure Deadline Repair
+
+- The public connection independently enforces the legacy response deadline,
+  including during shutdown drain; expiry drops the stream and upstream driver.
+- The no-read regression occupies all 128 public permits, keeps clients open,
+  verifies upstream cancellation within 1.5 seconds for a 700 ms deadline, and
+  verifies a new public request succeeds before any client is closed.
+- The probe failed against the original binary and passed three repetitions each
+  with and without drain against the repair. Native transport verification,
+  locked release build/tests, formatting, Clippy and shell syntax passed.
+  Python trace coverage increased from 0 to 37 executed lines in the new probe.
+
 ## External Prerequisites
 
 Production activation still requires operator-owned public TLS, an upstream SAN
