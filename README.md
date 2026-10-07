@@ -57,6 +57,13 @@ docker run --rm -p 8002:8002 harbour-eshop
 
 Then open <https://localhost:8002> and accept the self-signed certificate.
 
+### Optional Rust Ingress
+
+The standalone [gateway bootstrap](migration/README.md) adds an opt-in HTTPS
+boundary without migrating any application routes. Building or merging it does
+not change the commands above. Activation requires explicit TLS/trust inputs and
+an exclusive, persistent Harbour runtime; rollback must retain the current DBFs.
+
 ### Try it from the command line
 
 ```sh

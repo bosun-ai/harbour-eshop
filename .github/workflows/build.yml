@@ -32,3 +32,19 @@ jobs:
           done
           docker logs eshop
           exit 1
+
+  gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.97.1'
+          components: rustfmt, clippy
+      - run: cargo build --locked --manifest-path gateway/Cargo.toml --release
+      - run: cargo test --locked --manifest-path gateway/Cargo.toml
+      - run: cargo fmt --manifest-path gateway/Cargo.toml --check
+      - run: cargo clippy --locked --manifest-path gateway/Cargo.toml --all-targets -- -D warnings
+      - run: docker build -t harbour-eshop:gateway-test .
+      - run: docker build -t harbour-eshop-gateway:gateway-test -f gateway/Dockerfile gateway
+      - run: python3 migration/verify.py --binary gateway/target/release/eshop-gateway --legacy-image harbour-eshop:gateway-test --gateway-image harbour-eshop-gateway:gateway-test

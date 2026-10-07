@@ -1,0 +1,15 @@
+# Paths inside the gateway container; all three files must be operator-provisioned.
+public_bind = "0.0.0.0:8002"
+management_bind = "127.0.0.1:9000"
+legacy_url = "https://legacy:8002"
+public_cert_file = "/tls/public.crt"
+public_key_file = "/tls/public.key"
+upstream_ca_file = "/tls/legacy-ca.crt"
+trusted_proxy_cidrs = []
+connect_timeout_ms = 5000
+header_timeout_ms = 30000
+body_idle_timeout_ms = 30000
+response_timeout_ms = 120000
+shutdown_drain_ms = 30000
+log_level = "info"
+active_families = []
