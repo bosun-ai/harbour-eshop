@@ -143,8 +143,10 @@ sharing, certificate rotation, metrics platform or deployment automation is
 included.
 
 `coverage.sh` measures LLVM 22 native **counter** coverage, without installing
-tools. It fails on unsupported profile formats rather than claiming line/branch
-coverage; a different compiler needs its matching LLVM report tools or an updated
-reader. Unit tests exercise activation decisions and header filtering; the
+tools. CI pins Rust 1.97.1 (LLVM 22.1.6) to match the raw-profile reader; validate
+the reader before upgrading the CI compiler. It fails on unsupported profile
+formats rather than claiming line/branch coverage; a different compiler needs
+its matching LLVM report tools or an updated reader. Unit tests exercise
+activation decisions and header filtering; the
 instrumented local fault corpus exercises adapter and lifecycle success/failure
 paths. Container parity uses the real release image separately.

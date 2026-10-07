@@ -35,6 +35,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
+          # The fail-closed native coverage reader supports LLVM 22 profiles.
+          toolchain: 1.97.1
           components: rustfmt, clippy
 
       - name: Gateway crate checks
