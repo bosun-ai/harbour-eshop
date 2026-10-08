@@ -53,6 +53,12 @@ fn registry() -> Vec<Registration> {
 }
 
 fn fixture() -> Config {
+    let (config, directory) = fixture_files();
+    fs::remove_dir_all(directory).unwrap();
+    config
+}
+
+fn fixture_files() -> (Config, std::path::PathBuf) {
     let directory = std::env::temp_dir().join(format!(
         "eshop-test-{}-{}",
         std::process::id(),
@@ -108,22 +114,24 @@ fn fixture() -> Config {
             .with_root_certificates(roots)
             .with_no_client_auth(),
     );
-    fs::remove_dir_all(directory).unwrap();
-    Config {
-        public_bind: "127.0.0.1:0".parse().unwrap(),
-        management_bind: "127.0.0.1:0".parse().unwrap(),
-        upstream: origin("https://localhost:1").unwrap(),
-        server_tls,
-        client_tls,
-        enabled_slices: vec![],
-        connect: Duration::from_secs(1),
-        header: Duration::from_secs(1),
-        request_body: Duration::from_secs(1),
-        upstream_response: Duration::from_secs(1),
-        body_idle: Duration::from_secs(1),
-        shutdown: Duration::from_secs(1),
-        log_level: "off".into(),
-    }
+    (
+        Config {
+            public_bind: "127.0.0.1:0".parse().unwrap(),
+            management_bind: "127.0.0.1:0".parse().unwrap(),
+            upstream: origin("https://localhost:1").unwrap(),
+            server_tls,
+            client_tls,
+            enabled_slices: vec![],
+            connect: Duration::from_secs(1),
+            header: Duration::from_secs(1),
+            request_body: Duration::from_secs(1),
+            upstream_response: Duration::from_secs(1),
+            body_idle: Duration::from_secs(1),
+            shutdown: Duration::from_secs(1),
+            log_level: "off".into(),
+        },
+        directory,
+    )
 }
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
@@ -491,4 +499,167 @@ async fn real_response_stream_terminates_without_replacement_or_retry() {
         assert_eq!(count.load(Ordering::Relaxed), 1);
         task.abort();
     }
+}
+
+fn large_response(_: Request<Body>, _: Context) -> Reply {
+    Box::pin(async { Ok(Response::new(body(vec![b'x'; 64 * 1024 * 1024]))) })
+}
+
+struct Executable {
+    child: std::process::Child,
+    directory: std::path::PathBuf,
+}
+impl Drop for Executable {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+async fn executable(config: &Config, directory: std::path::PathBuf) -> (Executable, u16) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let child = Command::new(env!("CARGO_BIN_EXE_eshop-gateway"))
+        .env("PUBLIC_BIND", format!("127.0.0.1:{port}"))
+        .env("MANAGEMENT_BIND", "127.0.0.1:0")
+        .env("PUBLIC_CERT", directory.join("cert.pem"))
+        .env("PUBLIC_KEY", directory.join("key.pem"))
+        .env("LEGACY_TRUST", directory.join("cert.pem"))
+        .env("LEGACY_UPSTREAM", config.upstream.to_string())
+        .env("ENABLED_SLICES", "")
+        .env("BODY_IDLE_SECONDS", "1")
+        .env("LOG_LEVEL", "off")
+        .spawn()
+        .unwrap();
+    let mut process = Executable { child, directory };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            assert!(
+                process.child.try_wait().unwrap().is_none(),
+                "gateway exited before binding"
+            );
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    (process, port)
+}
+
+// Observe the server socket without reading (and thereby relieving backpressure).
+#[cfg(target_os = "linux")]
+fn established_queue(server: u16, client: u16) -> Option<usize> {
+    fs::read_to_string("/proc/net/tcp")
+        .unwrap()
+        .lines()
+        .skip(1)
+        .find_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let local = fields[1].split(':').nth(1)?;
+            let remote = fields[2].split(':').nth(1)?;
+            if u16::from_str_radix(local, 16).ok()? == server
+                && u16::from_str_radix(remote, 16).ok()? == client
+                && fields[3] == "01"
+            {
+                usize::from_str_radix(fields[4].split(':').next()?, 16).ok()
+            } else {
+                None
+            }
+        })
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn executable_bounds_stalled_tls_reader_without_retry() {
+    use tokio::io::AsyncWriteExt;
+    let (mut config, directory) = fixture_files();
+    let (task, count) = upstream(&mut config, large_response).await;
+    let (_process, port) = executable(&config, directory).await;
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(16 * 1024).unwrap();
+    let stream = socket.connect(([127, 0, 0, 1], port).into()).await.unwrap();
+    let client = stream.local_addr().unwrap().port();
+    let mut stream = tokio_rustls::TlsConnector::from(config.client_tls.clone())
+        .connect(
+            tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            stream,
+        )
+        .await
+        .unwrap();
+    stream
+        .write_all(b"GET /large HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    stream.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        established_queue(port, client).is_some_and(|queue| queue > 0),
+        "must first reproduce socket backpressure"
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while established_queue(port, client).is_some() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("stalled connection retained after write deadline");
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn executable_allows_slow_progressing_tls_reader() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut config, directory) = fixture_files();
+    let (task, count) = upstream(&mut config, large_response).await;
+    let (_process, port) = executable(&config, directory).await;
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(64 * 1024).unwrap();
+    let stream = socket.connect(([127, 0, 0, 1], port).into()).await.unwrap();
+    let mut stream = tokio_rustls::TlsConnector::from(config.client_tls.clone())
+        .connect(
+            tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            stream,
+        )
+        .await
+        .unwrap();
+    stream
+        .write_all(b"GET /large HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    stream.flush().await.unwrap();
+    let started = std::time::Instant::now();
+    let mut received = Vec::new();
+    let mut buffer = [0; 64 * 1024];
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let length = stream.read(&mut buffer).await.unwrap();
+            if length == 0 {
+                break;
+            }
+            received.extend_from_slice(&buffer[..length]);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(started.elapsed() > Duration::from_secs(1));
+    let header_end = received
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    assert!(received.starts_with(b"HTTP/1.1 200"));
+    assert_eq!(received.len() - header_end, 64 * 1024 * 1024);
+    assert!(received[header_end..].iter().all(|byte| *byte == b'x'));
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+    task.abort();
 }

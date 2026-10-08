@@ -48,7 +48,7 @@ startup before public binding. PEM certificate/key matching is verified by Rustl
 | `HEADER_SECONDS` | 30, matching legacy's existing header wait |
 | `REQUEST_BODY_SECONDS` | 120 total body deadline, matching legacy's body wait |
 | `UPSTREAM_RESPONSE_SECONDS` | 150 to response headers, includes known-length upload |
-| `BODY_IDLE_SECONDS` | 30 inactivity limit on body streams |
+| `BODY_IDLE_SECONDS` | 30 inactivity limit on body streams and stalled public socket writes/flushes |
 | `SHUTDOWN_SECONDS` | 10 drain deadline; unfinished connections are dropped |
 
 Every timeout must be an integer from 1 to 300 seconds. Public TLS is HTTP/1.1
@@ -114,6 +114,10 @@ Before response headers, connect and TLS failures return 502, deadlines return
 inside Hyper can surface as a protocol 502; an unknown-length body failing during
 buffering surfaces as a deadline 504. After headers, stream failure/idle timeout
 terminates the response, never invents a replacement response or replays a request.
+Public socket write/flush deadlines operate below TLS, independently of body
+polling, including the final buffered frame. Successful socket writes reset the
+inactivity deadline; slow clients making progress are not subject to a total
+response-write deadline. Idle connections without pending writes are unaffected.
 SIGINT/SIGTERM stops acceptance, drains active connections and aborts at the
 deadline; it never writes `.uhttpd.stop` or controls Harbour.
 

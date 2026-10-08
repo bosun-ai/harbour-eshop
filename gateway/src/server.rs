@@ -12,14 +12,111 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use std::{
     convert::Infallible,
     future::Future,
+    io,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Instant,
+    task::{Context as TaskContext, Poll},
+    time::{Duration, Instant},
 };
-use tokio::{net::TcpListener, sync::watch, task::JoinSet, time::timeout};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpListener,
+    sync::watch,
+    task::JoinSet,
+    time::{Sleep, timeout},
+};
 use tokio_rustls::TlsAcceptor;
+
+// Below TLS: accepting plaintext into TLS buffers is not socket write progress.
+struct WriteDeadline<Io> {
+    inner: Io,
+    idle: Duration,
+    stalled: Option<Pin<Box<Sleep>>>,
+}
+
+impl<Io> WriteDeadline<Io> {
+    fn new(inner: Io, idle: Duration) -> Self {
+        Self {
+            inner,
+            idle,
+            stalled: None,
+        }
+    }
+
+    fn expired(&mut self, context: &mut TaskContext<'_>) -> bool {
+        self.stalled
+            .as_mut()
+            .is_some_and(|timer| timer.as_mut().poll(context).is_ready())
+    }
+
+    fn track<T>(
+        &mut self,
+        context: &mut TaskContext<'_>,
+        result: Poll<io::Result<T>>,
+    ) -> Poll<io::Result<T>> {
+        if result.is_pending() {
+            let timer = self
+                .stalled
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(self.idle)));
+            if timer.as_mut().poll(context).is_ready() {
+                return Poll::Ready(Err(io::ErrorKind::TimedOut.into()));
+            }
+        } else {
+            self.stalled = None;
+        }
+        result
+    }
+}
+
+impl<Io: AsyncRead + Unpin> AsyncRead for WriteDeadline<Io> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
+impl<Io: AsyncWrite + Unpin> AsyncWrite for WriteDeadline<Io> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.expired(context) {
+            return Poll::Ready(Err(io::ErrorKind::TimedOut.into()));
+        }
+        let result = Pin::new(&mut self.inner).poll_write(context, bytes);
+        // A zero-byte write is not progress (the caller handles WriteZero).
+        if matches!(result, Poll::Ready(Ok(0))) {
+            return result;
+        }
+        self.track(context, result)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        if self.expired(context) {
+            return Poll::Ready(Err(io::ErrorKind::TimedOut.into()));
+        }
+        let result = Pin::new(&mut self.inner).poll_flush(context);
+        self.track(context, result)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.expired(context) {
+            return Poll::Ready(Err(io::ErrorKind::TimedOut.into()));
+        }
+        let result = Pin::new(&mut self.inner).poll_shutdown(context);
+        self.track(context, result)
+    }
+}
 
 /// Shared dispatcher exercised by production and boundary tests.
 pub async fn dispatch(
@@ -76,6 +173,7 @@ pub async fn run(
                 let (stream, _) = accepted?;
                 let (config, legacy, dispatcher, acceptor, counter, mut stopped) = (config.clone(), legacy.clone(), dispatcher.clone(), acceptor.clone(), counter.clone(), stopped.clone());
                 tasks.spawn(async move {
+                    let stream = WriteDeadline::new(stream, config.body_idle);
                     let Ok(Ok(stream)) = timeout(config.connect, acceptor.accept(stream)).await else { return; };
                     let service_config = config.clone();
                     let service = service_fn(move |request: Request<Incoming>| {
@@ -141,4 +239,46 @@ pub async fn run(
         while tasks.join_next().await.is_some() {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    struct FinalFlush;
+    impl AsyncWrite for FinalFlush {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut TaskContext<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_final_flush_and_shutdown_expire_without_body_polls() {
+        for shutdown in [false, true] {
+            let mut stream = WriteDeadline::new(FinalFlush, Duration::from_millis(30));
+            stream.write_all(b"final frame").await.unwrap();
+            let error = timeout(Duration::from_secs(1), async {
+                if shutdown {
+                    stream.shutdown().await
+                } else {
+                    stream.flush().await
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        }
+    }
 }
