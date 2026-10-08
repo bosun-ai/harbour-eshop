@@ -14,6 +14,134 @@ type Body = http_body_util::combinators::UnsyncBoxBody<bytes::Bytes, Error>;
 use hyper::{Method, Request, StatusCode};
 use std::collections::HashSet;
 
+#[tokio::test]
+async fn buffered_response_write_and_flush_stalls_close_connection() {
+    use std::{
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+        time::Duration,
+    };
+    struct Stalled {
+        flush: bool,
+        written: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+    }
+    impl Drop for Stalled {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+    impl hyper::rt::Read for Stalled {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: hyper::rt::ReadBufCursor<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+    impl hyper::rt::Write for Stalled {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.flush {
+                self.written.fetch_add(buffer.len(), Ordering::SeqCst);
+                Poll::Ready(Ok(buffer.len()))
+            } else {
+                Poll::Pending
+            }
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    for flush in [false, true] {
+        let written = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let io = transport::WriteDeadline::new(
+            Stalled {
+                flush,
+                written: written.clone(),
+                dropped: dropped.clone(),
+            },
+            Duration::from_millis(40),
+        );
+        // The complete response fits Hyper's buffer; no body polling remains at flush.
+        let service = hyper::service::service_fn(|_| async {
+            Ok::<_, std::convert::Infallible>(legacy::text(StatusCode::OK, "fully buffered"))
+        });
+        // Supply a complete request using an in-memory reader while keeping writes stalled.
+        struct RequestIo {
+            output: transport::WriteDeadline<Stalled>,
+            request: &'static [u8],
+        }
+        impl hyper::rt::Read for RequestIo {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                mut buffer: hyper::rt::ReadBufCursor<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                let length = buffer.remaining().min(self.request.len());
+                buffer.put_slice(&self.request[..length]);
+                self.request = &self.request[length..];
+                if length == 0 {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+        impl hyper::rt::Write for RequestIo {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                context: &mut Context<'_>,
+                buffer: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Pin::new(&mut self.output).poll_write(context, buffer)
+            }
+            fn poll_flush(
+                mut self: Pin<&mut Self>,
+                context: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.output).poll_flush(context)
+            }
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                context: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.output).poll_shutdown(context)
+            }
+        }
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            hyper::server::conn::http1::Builder::new().serve_connection(
+                RequestIo {
+                    output: io,
+                    request: b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                },
+                service,
+            ),
+        )
+        .await
+        .expect("stalled output must terminate independently of body polling");
+        assert!(result.is_err());
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(
+            written.load(Ordering::SeqCst) > "fully buffered".len(),
+            flush
+        );
+    }
+}
+
 fn handler(
     _: Request<Body>,
     context: gateway::Context,

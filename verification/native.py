@@ -56,6 +56,14 @@ def main():
             elif self.path == "/redirect":
                 self.respond(b"redirect", 303, [("Location", "https://unchanged.example/path")])
                 return
+            elif self.path == "/non-reader":
+                self.send_response(200)
+                self.send_header("Content-Length", str(64 * 1024 * 1024))
+                self.end_headers()
+                for _ in range(1024):
+                    self.wfile.write(b"x" * 65536)
+                self.close_connection = True
+                return
             self.respond(b"Hello!" if self.path == "/hello" else b"synthetic")
 
         def respond(self, body, status=200, extra=()):
@@ -116,6 +124,35 @@ def main():
             assert response.count(b"set-cookie:") == 2 and b"x-remove:" not in response.lower()
             _, headers, _ = observations[-1]
             assert headers.get_all("Cookie") == ["a=1", "b=2"] and "Forwarded" not in headers and "X-Remove" not in headers
+            # Non-reading TLS clients must release gateway sockets while staying open.
+            descriptors = pathlib.Path(f"/proc/{process.pid}/fd")
+            time.sleep(0.2)  # Let the preceding completed connections be reclaimed.
+            baseline = len(list(descriptors.iterdir()))
+            blocked = []
+            try:
+                for _ in range(3):
+                    tcp = socket.socket()
+                    tcp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+                    tcp.settimeout(8)
+                    tcp.connect(("localhost", public))
+                    connection = client.context.wrap_socket(tcp, server_hostname="localhost")
+                    blocked.append(connection)
+                    connection.sendall(b"GET /non-reader HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                deadline = time.monotonic() + 2
+                while counts["/non-reader"] != 3:
+                    assert time.monotonic() < deadline, "non-reader requests did not reach upstream"
+                    time.sleep(0.05)
+                assert len(list(descriptors.iterdir())) >= baseline + 3
+                deadline = time.monotonic() + 7
+                while len(list(descriptors.iterdir())) > baseline:
+                    assert process.poll() is None, "gateway exited during stalled writes"
+                    assert time.monotonic() < deadline, "non-reading clients retained gateway descriptors"
+                    time.sleep(0.05)
+                assert counts["/non-reader"] == 3, "stalled responses were retried"
+            finally:
+                for connection in blocked:
+                    connection.close()
+            assert client.request("/hello")[0] == 200
             assert client.request("/stall")[0] == 504 and counts["/stall"] == 1
             for path in ["/partial", "/slow-response"]:
                 try:
@@ -175,7 +212,7 @@ def main():
                 assert subprocess.run([binary, "healthcheck"], env=failure_env, timeout=12, capture_output=True).returncode != 0
                 process.terminate()
                 assert process.wait(timeout=4) == 0
-            print("PASS: native cargo run; large/slow fixed framing, encoded target, duplicate headers, no retries, partial/deadline failures, cancellation, TLS failures, SIGTERM")
+            print("PASS: native cargo run; large/slow fixed framing, non-reader socket reclamation, encoded target, duplicate headers, no retries, partial/deadline failures, cancellation, TLS failures, SIGTERM")
         finally:
             if process is not None and process.poll() is None:
                 process.kill()

@@ -51,12 +51,15 @@ gateway/target/debug/eshop-gateway healthcheck
 | `ENABLED_ROUTE_FAMILIES` | Comma-separated stable IDs; empty by default; unknown IDs fail startup |
 | `CONNECT_TIMEOUT_SECS` | Default 5; TCP plus TLS deadline, also public TLS handshake |
 | `UPLOAD_TIMEOUT_SECS` | Default 30; header-read timeout and body deadline after headers |
-| `RESPONSE_TIMEOUT_SECS` | Default 60; upstream response headers/body deadline and handler deadline |
+| `RESPONSE_TIMEOUT_SECS` | Default 60; upstream response headers/body, handler, and downstream write/flush deadlines |
 | `DRAIN_TIMEOUT_SECS` | Default 10; SIGTERM/SIGINT drain then cancellation |
 | `LOG_LEVEL` | Default `info`; validated tracing level, not filter expressions |
 
 Timeouts are integer seconds in 1..300; connect <= upload <= response. Upload
-and response deadlines are total deadlines, not inactivity timers. Distinct
+and response deadlines are total deadlines, not inactivity timers. Each downstream
+output phase is bounded from its first write through successful flush, independently
+of body polling; expiry closes the public connection and drops its upstream guard.
+Successful flush resets that output-phase deadline for subsequent writes. Distinct
 listeners are required. `/live` measures process availability; `/ready` performs
 a trusted upstream GET `/hello` requiring exactly `200 Hello!`. The operational
 listener must remain loopback/native or unpublished/container. Public `/live`,
@@ -166,20 +169,22 @@ claiming the gateway fixes them.
 
 Implementation verification passed using the available local tools:
 
-- Locked native build, four Rust boundary tests, rustfmt check and warnings-as-errors
+- Locked native build, five Rust boundary tests, rustfmt check and warnings-as-errors
   Clippy; real unchanged Harbour Docker build and separate gateway Docker build.
 - Real native `cargo run` and container entrypoints; 36 direct/proxy application
   hops with independent state/cookie jars, static bytes, validation retained values,
   account retries, navigation/pagination, login/logout and cart characterization.
 - Synthetic verified TLS upstream: large/slow fixed-length uploads, encoded target,
   repeated cookies/Set-Cookie, Host, hop headers, unchanged absolute Location,
-  response deadline 504, partial/slow body failure, cancellation without replay,
+  response deadline 504, partial/slow body failure, non-reading TLS client socket
+  reclamation, fully buffered response write/flush deadlines, cancellation without replay,
   wrong hostname and unrelated CA failure, and in-flight bounded SIGTERM drain.
 - Invalid TLS/configuration/activation inputs, incomplete headers/uploads, upstream
   unavailable/restored, process/readiness checks, listener-level activation and
   handler failure without fallback, private-port/mount isolation, same-state rollback.
-- Existing Rust `-C instrument-coverage` instrumentation confirms exercised counters
-  increase from 0 (all tests skipped) to 6,518 of 18,339 (four tests). This includes
+- Rust `-C instrument-coverage` instrumentation confirms exercised counters
+  increase from 6,518 (four existing tests) to 6,704 of 18,916 (five tests), with
+  188 previously unexercised counters reached by the added regression. This includes
   dependency code; it is **not** a source-line coverage percentage. LLVM report
   tooling is unavailable, so no line/branch percentage is claimed or tool installed.
 - Disposable runner containers, networks, volumes, certificates and image tags were

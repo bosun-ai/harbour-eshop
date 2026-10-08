@@ -12,10 +12,12 @@ use std::{
     convert::Infallible,
     fs::File,
     io::BufReader,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    task::{Context as TaskContext, Poll},
     time::Duration,
 };
 use tokio::{
@@ -25,6 +27,91 @@ use tokio::{
     time::{Instant, timeout},
 };
 use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
+
+// Bound each output phase through successful flush, including buffered bodies.
+pub(crate) struct WriteDeadline<T> {
+    io: T,
+    limit: Duration,
+    timer: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<T> WriteDeadline<T> {
+    pub(crate) fn new(io: T, limit: Duration) -> Self {
+        Self {
+            io,
+            limit,
+            timer: None,
+        }
+    }
+
+    fn check(&mut self, context: &mut TaskContext<'_>) -> std::io::Result<()> {
+        use std::future::Future;
+        let timer = self
+            .timer
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(self.limit)));
+        if timer.as_mut().poll(context).is_ready() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "downstream write deadline exceeded",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<T: hyper::rt::Read + Unpin> hyper::rt::Read for WriteDeadline<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(context, buffer)
+    }
+}
+
+impl<T: hyper::rt::Write + Unpin> hyper::rt::Write for WriteDeadline<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.check(context)?;
+        Pin::new(&mut self.io).poll_write(context, buffer)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffers: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        self.check(context)?;
+        Pin::new(&mut self.io).poll_write_vectored(context, buffers)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.check(context)?;
+        let result = Pin::new(&mut self.io).poll_flush(context);
+        if matches!(result, Poll::Ready(Ok(()))) {
+            self.timer = None;
+        }
+        result
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.check(context)?;
+        Pin::new(&mut self.io).poll_shutdown(context)
+    }
+}
 
 pub(crate) async fn healthcheck() -> Result<(), Error> {
     let address = setting("ADMIN_BIND", "127.0.0.1:8003");
@@ -82,6 +169,7 @@ pub(crate) async fn serve(config: Config, entries: Vec<Registration>) -> Result<
                 tasks.spawn(async move {
                     let Ok(Ok(tls)) = timeout(config.connect, acceptor.accept(tcp)).await else { return; };
                     let header_timeout = config.upload;
+                    let write_timeout = config.response;
                     let service = service_fn(move |mut request: Request<hyper::body::Incoming>| {
                         let legacy = legacy.clone();
                         let config = config.clone();
@@ -120,7 +208,7 @@ pub(crate) async fn serve(config: Config, entries: Vec<Registration>) -> Result<
                     });
                     let mut builder = hyper::server::conn::http1::Builder::new();
                     builder.timer(TokioTimer::new()).header_read_timeout(header_timeout).auto_date_header(false);
-                    let connection = builder.serve_connection(TokioIo::new(tls), service);
+                    let connection = builder.serve_connection(WriteDeadline::new(TokioIo::new(tls), write_timeout), service);
                     tokio::pin!(connection);
                     tokio::select! {
                         _ = &mut connection => {},
