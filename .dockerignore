@@ -5,3 +5,5 @@ app/*.log
 app/private.key
 app/certificate.crt
 app/eshop
+gateway/target
+local

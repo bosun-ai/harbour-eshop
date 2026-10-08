@@ -1,0 +1,36 @@
+# Explicitly selected bootstrap, never the legacy default.
+services:
+  legacy:
+    build: .
+    image: harbour-eshop:bootstrap
+    volumes:
+      - runtime:/app
+      - ./local/tls/legacy.crt:/app/certificate.crt:ro
+      - ./local/tls/legacy.key:/app/private.key:ro
+    networks: [upstream]
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    image: eshop-gateway:bootstrap
+    environment:
+      GATEWAY_PUBLIC_BIND: 0.0.0.0:8002
+      GATEWAY_ADMIN_BIND: 0.0.0.0:8003
+      GATEWAY_TLS_CERT: /tls/public.crt
+      GATEWAY_TLS_KEY: /tls/public.key
+      GATEWAY_LEGACY_URL: https://legacy:8002
+      GATEWAY_LEGACY_CA: /tls/legacy.crt
+      GATEWAY_ENABLED_SLICES: ${GATEWAY_ENABLED_SLICES:-}
+    ports: ["8002:8002"]
+    volumes:
+      - ./local/tls/public.crt:/tls/public.crt:ro
+      - ./local/tls/public.key:/tls/public.key:ro
+      - ./local/tls/legacy.crt:/tls/legacy.crt:ro
+    networks: [upstream, public]
+    stop_grace_period: 15s
+networks:
+  upstream:
+    internal: true
+  public: {}
+volumes:
+  runtime: {}

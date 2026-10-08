@@ -100,4 +100,9 @@ docker-entrypoint.sh     creates a self-signed certificate, starts eshop
 
 ## CI
 
+An independent, opt-in HTTPS gateway bootstrap is documented in
+[`docs/bootstrap.md`](docs/bootstrap.md). It proxies to Harbour without migrating
+application behavior; merging it does not change the default commands above.
+The additive `bootstrap.yml` job checks that boundary separately.
+
 [`build.yml`](.github/workflows/build.yml) builds the Docker image, which compiles Harbour and `eshop.prg` with warnings treated as errors (`-w3 -es2`). It then starts the container and checks that `/hello` responds. The code is upstream sample code, so there's no separate test suite.

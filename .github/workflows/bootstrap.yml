@@ -1,0 +1,49 @@
+name: bootstrap
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+      - name: Rust checks
+        run: |
+          cargo build --locked --manifest-path gateway/Cargo.toml
+          cargo test --locked --manifest-path gateway/Cargo.toml
+          cargo fmt --manifest-path gateway/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path gateway/Cargo.toml --all-targets -- -D warnings
+      - name: Build images and start opt-in composition
+        run: |
+          docker build -f gateway/Dockerfile -t eshop-gateway:bootstrap .
+          python3 - <<'PY'
+          import importlib.util
+          import pathlib
+          spec = importlib.util.spec_from_file_location('verify', 'scripts/verify-bootstrap.py')
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          directory = pathlib.Path('local/tls')
+          directory.mkdir(parents=True)
+          module.certificates(directory)
+          PY
+          docker compose -p eshop-bootstrap -f compose.bootstrap.yml build
+          docker compose -p eshop-bootstrap -f compose.bootstrap.yml up -d
+          python3 scripts/verify-bootstrap.py --project eshop-bootstrap
+      - name: Instrumented tests
+        run: |
+          mkdir -p gateway/target/coverage
+          RUSTFLAGS='-C instrument-coverage' LLVM_PROFILE_FILE="$PWD/gateway/target/coverage/%p-%m.profraw" cargo test --locked --manifest-path gateway/Cargo.toml
+          tools="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/host: //p')/bin"
+          "$tools/llvm-profdata" merge -sparse gateway/target/coverage/*.profraw -o gateway/target/coverage/tests.profdata
+          binary=$(find gateway/target/debug/deps -maxdepth 1 -type f -executable -name 'eshop_gateway-*' -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)
+          "$tools/llvm-cov" report "$binary" --instr-profile=gateway/target/coverage/tests.profdata --ignore-filename-regex='/.cargo/'
+      - name: Cleanup
+        if: always()
+        run: docker compose -p eshop-bootstrap -f compose.bootstrap.yml down -v
