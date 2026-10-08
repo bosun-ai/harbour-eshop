@@ -1,5 +1,9 @@
 //! One verified TLS connection per request: no pool, redirect, decompression or retry.
-use crate::{Body, Error, config::Config, response};
+use crate::{
+    Body, Error,
+    config::{Config, upstream_port},
+    response,
+};
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::{
@@ -62,6 +66,15 @@ pub fn strip_hop_headers(headers: &mut HeaderMap) {
 
 // The timer is reset only by a body frame, not by repeated polls. Dropping a
 // response also drops its single-use upstream connection driver.
+#[derive(Debug)]
+struct StreamIdleTimeout;
+impl std::fmt::Display for StreamIdleTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("stream idle timeout")
+    }
+}
+impl std::error::Error for StreamIdleTimeout {}
+
 struct IdleBody<B> {
     inner: B,
     timer: Pin<Box<Sleep>>,
@@ -102,7 +115,7 @@ where
             Poll::Pending => {
                 if self.timer.as_mut().poll(context).is_ready() {
                     tracing::warn!(failure = "stream_idle", "body terminated");
-                    Poll::Ready(Some(Err("stream idle timeout".into())))
+                    Poll::Ready(Some(Err(StreamIdleTimeout.into())))
                 } else {
                     Poll::Pending
                 }
@@ -149,7 +162,7 @@ impl LegacyUpstream {
                 .unwrap()
                 .trim_matches(['[', ']'])
                 .into(),
-            port: config.origin.port_u16().unwrap_or(443),
+            port: upstream_port(&config.origin)?,
             authority: config.origin.authority().unwrap().to_string(),
             tls: TlsConnector::from(Arc::new(tls)),
             connect: config.connect,
@@ -206,16 +219,13 @@ impl LegacyUpstream {
                 strip_hop_headers(upstream.headers_mut());
                 upstream.map(|body| bounded_body(body, self.idle, guard.0.take()))
             }
-            error => {
+            Ok(Err(error)) => {
                 driver.abort();
-                failure(
-                    error.is_err(),
-                    if error.is_err() {
-                        "header_timeout"
-                    } else {
-                        "upstream_protocol"
-                    },
-                )
+                protocol_failure(&error)
+            }
+            Err(_) => {
+                driver.abort();
+                failure(true, "header_timeout")
             }
         }
     }
@@ -251,6 +261,18 @@ impl LegacyUpstream {
             .await
             .unwrap_or(false)
     }
+}
+
+fn protocol_failure(error: &(dyn std::error::Error + 'static)) -> Response<Body> {
+    // Hyper wraps upload-body failures; preserve the cause before headers.
+    let mut cause = Some(error);
+    while let Some(error) = cause {
+        if error.is::<StreamIdleTimeout>() {
+            return failure(true, "stream_idle");
+        }
+        cause = error.source();
+    }
+    failure(false, "upstream_protocol")
 }
 
 fn failure(timed_out: bool, category: &'static str) -> Response<Body> {
@@ -304,7 +326,16 @@ mod tests {
             Duration::from_millis(5),
             Some(driver.abort_handle()),
         );
-        assert!(body.frame().await.unwrap().is_err());
+        let error = body.frame().await.unwrap().unwrap_err();
+        assert!(error.is::<StreamIdleTimeout>());
+        assert_eq!(
+            protocol_failure(error.as_ref()).status(),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+        assert_eq!(
+            protocol_failure(&std::io::Error::other("protocol failure")).status(),
+            StatusCode::BAD_GATEWAY
+        );
         drop(body);
         assert!(driver.await.unwrap_err().is_cancelled());
         let mut body = bounded_body(

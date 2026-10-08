@@ -57,7 +57,25 @@ fn origin(value: &str) -> Result<Uri, Error> {
     {
         return Err("invalid HTTPS origin".into());
     }
+    upstream_port(&uri)?;
     Ok(uri)
+}
+
+/// Default to HTTPS only when the authority has no explicit port.
+pub fn upstream_port(uri: &Uri) -> Result<u16, Error> {
+    let authority = uri.authority().ok_or("missing upstream authority")?;
+    let host = uri.host().ok_or("missing upstream host")?;
+    match authority.as_str().strip_prefix(host) {
+        Some("") => Ok(443),
+        Some(suffix) => {
+            let port = suffix.strip_prefix(':').ok_or("invalid upstream port")?;
+            if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err("invalid upstream port".into());
+            }
+            port.parse().map_err(|_| "invalid upstream port".into())
+        }
+        None => Err("invalid upstream authority".into()),
+    }
 }
 
 impl Config {
@@ -133,5 +151,18 @@ mod tests {
             assert!(positive_duration(bad).is_err());
         }
         assert!(positive_duration("1").is_ok());
+    }
+
+    #[test]
+    fn validates_explicit_ports_including_ipv6() {
+        for host in ["localhost", "[::1]"] {
+            for port in ["abc", "99999", "65536", "", "-1", "+443"] {
+                assert!(origin(&format!("https://{host}:{port}")).is_err());
+            }
+            for (suffix, expected) in [("", 443), (":0", 0), (":8002", 8002), (":65535", 65535)] {
+                let uri = origin(&format!("https://{host}{suffix}")).unwrap();
+                assert_eq!(upstream_port(&uri).unwrap(), expected);
+            }
+        }
     }
 }

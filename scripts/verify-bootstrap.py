@@ -291,6 +291,25 @@ def transport_checks(fixtures):
         except (http.client.IncompleteRead, OSError):
             pass
         time.sleep(2.1)
+        # Upload inactivity must beat a longer header deadline and retain its
+        # classification through Hyper's wrapped send_request error.
+        process.terminate()
+        process.wait(timeout=4)
+        env["GATEWAY_HEADER_SECONDS"] = "5"
+        process = subprocess.Popen([str(ROOT / "gateway/target/debug/eshop-gateway")], env={**os.environ, **env}, stdout=log, stderr=log)
+        wait(lambda: client.request("/wire")[0] == 200)
+        log.flush()
+        log.seek(0, os.SEEK_END)
+        upload_log_start = log.tell()
+        started = time.monotonic()
+        partial_upload = raw_request(client, b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\nConnection: close\r\n\r\nx")
+        assert partial_upload.startswith(b"HTTP/1.1 504"), partial_upload
+        assert time.monotonic() - started < 4, "upload waited for header deadline"
+        log.flush()
+        log.seek(upload_log_start)
+        upload_logs = log.read()
+        assert '"failure":"stream_idle"' in upload_logs, upload_logs
+        assert "upstream_protocol" not in upload_logs and "header_timeout" not in upload_logs, upload_logs
         # An aborted client must not cause a replay or kill the listener.
         with socket.create_connection(("localhost", port), timeout=4) as tcp:
             with client.context.wrap_socket(tcp, server_hostname="localhost") as stream:
@@ -361,6 +380,10 @@ def verify(args):
                 ("-unknown", {"GATEWAY_ENABLED_SLICES": "not-registered"}),
                 ("-missing", {"GATEWAY_TLS_CERT": "/missing"}),
                 ("-invalid", {"GATEWAY_LEGACY_URL": "http://legacy:8002"}),
+                ("-invalid-port", {"GATEWAY_LEGACY_URL": "https://localhost:abc"}),
+                ("-overflow-port", {"GATEWAY_LEGACY_URL": "https://localhost:99999"}),
+                ("-invalid-ipv6-port", {"GATEWAY_LEGACY_URL": "https://[::1]:abc"}),
+                ("-overflow-ipv6-port", {"GATEWAY_LEGACY_URL": "https://[::1]:99999"}),
                 ("-invalid-key", {"GATEWAY_TLS_KEY": "/tls/legacy.crt"}),
                 ("-invalid-timeout", {"GATEWAY_IDLE_SECONDS": "0"}),
                 ("-invalid-log", {"GATEWAY_LOG_LEVEL": "verbose"}),
@@ -368,6 +391,7 @@ def verify(args):
                 name = fixtures.gateway(suffix, **overrides)
                 wait(lambda: command("docker", "inspect", "-f", "{{.State.Status}}", name) == "exited")
                 assert command("docker", "inspect", "-f", "{{.State.ExitCode}}", name) == "1"
+                assert "gateway listening" not in command("docker", "logs", name)
             for suffix, overrides in [
                 ("-wrong-host", {"GATEWAY_LEGACY_URL": "https://wrong:8002"}),
                 ("-wrong-trust", {"GATEWAY_LEGACY_CA": "/tls/public.crt"}),
