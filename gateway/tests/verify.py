@@ -197,6 +197,8 @@ class TestUpstream(http.server.BaseHTTPRequestHandler):
             self.connection.shutdown(socket.SHUT_RDWR)
             self.connection.close()
             return
+        if self.path == "/delayed-headers":
+            time.sleep(0.3)
         if self.path in ("/slow", "/drain"):
             time.sleep(2 if self.path == "/slow" else 0.5)
         length = int(self.headers.get("Content-Length", "0"))
@@ -389,6 +391,27 @@ def adapter_checks(runtime, binary):
                 assert b" 502 " in result or result == b"", "stalled upload was not terminated"
         assert counts().get("/slow-upload", 0) <= 1
 
+        equal_limits = {
+            "total_request_ms = 180000": "total_request_ms = 100",
+            "upstream_response_ms = 1200": "upstream_response_ms = 100",
+        }
+
+        def delayed_header_checks(endpoint):
+            before = counts().get("/delayed-headers", 0)
+            for _ in range(30):
+                started = time.monotonic()
+                response = endpoint.request("/delayed-headers")
+                assert response[0] == 504 and response[2] == b"upstream_deadline", response
+                assert any(key.lower() == "x-request-id" for key, _ in response[1])
+                assert time.monotonic() - started < 1, "pre-header timeout was not bounded"
+            assert counts().get("/delayed-headers", 0) == before + 30, "deadline request retried"
+            assert endpoint.request("/hello")[2] == b"Hello!"
+
+        equal_name = runtime.gateway("equal-deadlines", upstream, equal_limits)
+        equal_endpoint, equal_health = runtime.endpoints(equal_name)
+        wait(lambda: equal_health.request("/ready")[0] == 200)
+        delayed_header_checks(equal_endpoint)
+
         # A real native local-run entrypoint, including invalid startup and graceful drain.
         if binary:
             with contextlib.closing(socket.socket()) as public_socket, contextlib.closing(socket.socket()) as management_socket:
@@ -411,6 +434,15 @@ def adapter_checks(runtime, binary):
                     assert request.result()[0] == 200
                 assert process.wait(timeout=5) == 0
             assert "stopped" in log.read_text()
+            equal_config = runtime.config("native-equal-deadlines", f"https://localhost:{probe.port}/",
+                                          {**changes, **equal_limits}, local=True)
+            with log.open("w") as output:
+                process = subprocess.Popen([str(binary)], env={**os.environ, "GATEWAY_CONFIG": str(equal_config)}, stdout=output, stderr=output)
+                runtime.processes.append(process)
+                wait(lambda: native.request("/hello")[2] == b"Hello!")
+                delayed_header_checks(native)
+                process.terminate()
+                assert process.wait(timeout=3) == 0
             # Inspect the native server's TCP state without reading buffered output:
             # recv() could unblock the writer and hide the deadline regression.
             def established(client_port):

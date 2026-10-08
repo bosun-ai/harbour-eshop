@@ -17,9 +17,17 @@ use crate::{
 
 #[derive(Clone, Default)]
 struct State {
-    requests: VecDeque<(u64, Instant, bool)>,
+    requests: VecDeque<RequestState>,
     next_id: u64,
     write_deadline: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct RequestState {
+    id: u64,
+    deadline: Instant,
+    responding: bool,
+    complete: bool,
 }
 
 /// Tracks requests until their final bytes have left Hyper and the TLS writer.
@@ -37,19 +45,33 @@ impl RequestDeadlines {
         }
     }
 
-    pub fn start(&self, total_ms: u64) -> u64 {
+    pub fn start(&self, total_ms: u64) -> (u64, Instant) {
         let mut id = 0;
+        let deadline = Instant::now() + Limits::duration(total_ms);
         self.state.send_modify(|state| {
             id = state.next_id;
             state.next_id += 1;
-            state
-                .requests
-                .push_back((id, Instant::now() + Limits::duration(total_ms), false));
+            state.requests.push_back(RequestState {
+                id,
+                deadline,
+                responding: false,
+                complete: false,
+            });
         });
-        id
+        (id, deadline)
     }
 
-    pub fn response(&self, id: u64, body: GatewayBody, head: bool) -> GatewayBody {
+    pub fn response(&self, id: u64, body: GatewayBody, head: bool, timed_out: bool) -> GatewayBody {
+        self.state.send_modify(|state| {
+            if let Some(request) = state.requests.iter_mut().find(|request| request.id == id) {
+                request.responding = true;
+                if timed_out {
+                    // Allow the locally generated 504 a bounded final flush after
+                    // the handler has spent its total budget, even with write progress.
+                    request.deadline = Instant::now() + Limits::duration(self.idle_ms);
+                }
+            }
+        });
         let remaining = body.size_hint().exact();
         // Hyper does not poll HEAD bodies or bodies whose declared length is zero.
         if head || body.is_end_stream() || remaining == Some(0) {
@@ -66,11 +88,11 @@ impl RequestDeadlines {
 
     fn complete(&self, id: u64) {
         self.state.send_if_modified(|state| {
-            if let Some(request) = state.requests.iter_mut().find(|request| request.0 == id) {
-                if request.2 {
+            if let Some(request) = state.requests.iter_mut().find(|request| request.id == id) {
+                if request.complete {
                     return false;
                 }
-                request.2 = true;
+                request.complete = true;
                 return true;
             }
             false
@@ -79,7 +101,9 @@ impl RequestDeadlines {
 
     fn writing(&self, progress: bool) {
         self.state.send_if_modified(|state| {
-            if !state.requests.is_empty() && (progress || state.write_deadline.is_none()) {
+            if state.requests.iter().any(|request| request.responding)
+                && (progress || state.write_deadline.is_none())
+            {
                 state.write_deadline = Some(Instant::now() + Limits::duration(self.idle_ms));
                 return true;
             }
@@ -90,7 +114,11 @@ impl RequestDeadlines {
     fn flushed(&self) {
         self.state.send_if_modified(|state| {
             let mut changed = state.write_deadline.is_some();
-            while state.requests.front().is_some_and(|request| request.2) {
+            while state
+                .requests
+                .front()
+                .is_some_and(|request| request.complete)
+            {
                 state.requests.pop_front();
                 changed = true;
             }
@@ -108,7 +136,9 @@ impl RequestDeadlines {
                 state
                     .requests
                     .iter()
-                    .map(|request| request.1)
+                    // The handler owns pre-header expiry and generates the 504.
+                    .filter(|request| request.responding)
+                    .map(|request| request.deadline)
                     .chain(state.write_deadline)
                     .min()
             };
@@ -266,17 +296,18 @@ mod tests {
     #[tokio::test]
     async fn exact_length_completion_does_not_require_an_eof_poll() {
         let deadlines = RequestDeadlines::new(200);
-        let id = deadlines.start(20);
+        let (id, _) = deadlines.start(20);
         let mut body = deadlines.response(
             id,
             ExactBody(Some(bytes::Bytes::from_static(b"last"))).boxed_unsync(),
+            false,
             false,
         );
         assert_eq!(
             body.frame().await.unwrap().unwrap().into_data().unwrap(),
             "last"
         );
-        assert!(deadlines.state.borrow().requests.front().unwrap().2);
+        assert!(deadlines.state.borrow().requests.front().unwrap().complete);
         deadlines.flushed();
         assert!(
             tokio::time::timeout(Limits::duration(40), deadlines.expired())
@@ -289,7 +320,7 @@ mod tests {
     async fn blocked_output_expires_without_body_polling() {
         for block_write in [true, false] {
             let deadlines = RequestDeadlines::new(20);
-            let id = deadlines.start(200);
+            let (id, _) = deadlines.start(200);
             let mut writer = DeadlineIo {
                 inner: Writer {
                     block_write,
@@ -297,11 +328,11 @@ mod tests {
                 },
                 deadlines: deadlines.clone(),
             };
+            let body = deadlines.response(id, full("final frame"), false, false);
             if !block_write {
                 // Hyper has consumed the final frame, but TLS still has output to flush.
-                let body = deadlines.response(id, full("final frame"), false);
                 assert_eq!(body.collect().await.unwrap().to_bytes(), "final frame");
-                assert!(deadlines.state.borrow().requests.front().unwrap().2);
+                assert!(deadlines.state.borrow().requests.front().unwrap().complete);
             }
             poll_fn(|context| {
                 if block_write {
@@ -325,31 +356,62 @@ mod tests {
     #[tokio::test]
     async fn total_deadline_and_idle_keepalive() {
         let deadlines = RequestDeadlines::new(1000);
-        let id = deadlines.start(20);
+        let (id, _) = deadlines.start(20);
+        let body = deadlines.response(id, full(""), false, false);
         tokio::time::timeout(Limits::duration(100), deadlines.expired())
             .await
             .unwrap();
-        deadlines
-            .response(id, full(""), false)
-            .collect()
-            .await
-            .unwrap();
+        body.collect().await.unwrap();
         deadlines.flushed();
         assert!(
             tokio::time::timeout(Limits::duration(40), deadlines.expired())
                 .await
                 .is_err()
         );
-        let id = deadlines.start(200);
+        let (id, _) = deadlines.start(200);
         deadlines
-            .response(id, full("next response"), false)
+            .response(id, full("next response"), false, false)
             .collect()
             .await
             .unwrap();
         deadlines.flushed();
         assert!(deadlines.state.borrow().requests.is_empty());
-        let id = deadlines.start(20);
-        let _head_body = deadlines.response(id, full("not polled by Hyper"), true);
+        let (id, _) = deadlines.start(20);
+        let _head_body = deadlines.response(id, full("not polled by Hyper"), true, false);
+        deadlines.flushed();
+        assert!(deadlines.state.borrow().requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pre_header_timeout_gets_bounded_error_flush() {
+        let deadlines = RequestDeadlines::new(40);
+        let (id, deadline) = deadlines.start(5);
+        tokio::time::sleep_until(deadline).await;
+        assert!(
+            tokio::time::timeout(Limits::duration(20), deadlines.expired())
+                .await
+                .is_err()
+        );
+        let body = deadlines.response(id, full("upstream_deadline"), false, true);
+        assert!(
+            tokio::time::timeout(Limits::duration(10), deadlines.expired())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            body.collect().await.unwrap().to_bytes(),
+            "upstream_deadline"
+        );
+        // Final output remains bounded even if the writer keeps making progress.
+        let flush_deadline = deadlines.state.borrow().requests.front().unwrap().deadline;
+        deadlines.writing(true);
+        assert_eq!(
+            deadlines.state.borrow().requests.front().unwrap().deadline,
+            flush_deadline
+        );
+        tokio::time::timeout(Limits::duration(100), deadlines.expired())
+            .await
+            .unwrap();
         deadlines.flushed();
         assert!(deadlines.state.borrow().requests.is_empty());
     }

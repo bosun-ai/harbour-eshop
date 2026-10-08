@@ -78,11 +78,12 @@ async fn run() -> Result<(), &'static str> {
                     let service = service_fn(move |request| {
                         let gateway = gateway.clone();
                         let deadlines = service_deadlines.clone();
-                        let id = deadlines.start(limits.total_request_ms);
+                        let (id, deadline) = deadlines.start(limits.total_request_ms);
                         let head = request.method() == hyper::Method::HEAD;
                         async move {
-                            gateway.public(request, peer).await.map(|response| {
-                                response.map(|body| deadlines.response(id, body, head))
+                            gateway.public(request, peer, deadline).await.map(|response| {
+                                let timed_out = response.extensions().get::<gateway::DeadlineResponse>().is_some();
+                                response.map(|body| deadlines.response(id, body, head, timed_out))
                             })
                         }
                     });

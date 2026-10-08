@@ -53,6 +53,10 @@ pub(crate) enum GatewayFailure {
     Deadline,
 }
 
+/// Marks a local pre-header timeout eligible for a bounded error-response flush.
+#[derive(Clone)]
+pub(crate) struct DeadlineResponse;
+
 impl GatewayFailure {
     fn response(&self) -> Response<GatewayBody> {
         let (status, message) = match self {
@@ -61,11 +65,15 @@ impl GatewayFailure {
             Self::Upstream => (StatusCode::BAD_GATEWAY, "upstream_unavailable"),
             Self::Deadline => (StatusCode::GATEWAY_TIMEOUT, "upstream_deadline"),
         };
-        Response::builder()
+        let mut response = Response::builder()
             .status(status)
             .header("content-type", "text/plain")
             .body(full(message))
-            .expect("static response")
+            .expect("static response");
+        if matches!(self, Self::Deadline) {
+            response.extensions_mut().insert(DeadlineResponse);
+        }
+        response
     }
 }
 
@@ -124,6 +132,7 @@ impl Gateway {
         &self,
         request: Request<Incoming>,
         peer: SocketAddr,
+        deadline: Instant,
     ) -> Result<Response<GatewayBody>, std::convert::Infallible> {
         let started = Instant::now();
         let request_id = format!(
@@ -134,7 +143,7 @@ impl Gateway {
         let context = RequestContext {
             request_id,
             peer,
-            deadline: started + Limits::duration(self.limits.total_request_ms),
+            deadline,
             shutdown: self.shutdown.clone(),
         };
         let method = request.method().clone();
