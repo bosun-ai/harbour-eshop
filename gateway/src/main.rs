@@ -1,6 +1,7 @@
 mod config;
 mod gateway;
 mod legacy;
+mod transport;
 
 use std::sync::Arc;
 
@@ -14,6 +15,7 @@ use crate::{
     config::{Config, Limits},
     gateway::Gateway,
     legacy::LegacyUpstream,
+    transport::{DeadlineIo, RequestDeadlines},
 };
 
 #[tokio::main]
@@ -71,22 +73,40 @@ async fn run() -> Result<(), &'static str> {
                             _ => { tracing::warn!(error_class = "client_tls", "connection_rejected"); return; }
                         },
                     };
+                    let deadlines = RequestDeadlines::new(limits.body_idle_ms);
+                    let service_deadlines = deadlines.clone();
                     let service = service_fn(move |request| {
                         let gateway = gateway.clone();
-                        async move { gateway.public(request, peer).await }
+                        let deadlines = service_deadlines.clone();
+                        let id = deadlines.start(limits.total_request_ms);
+                        let head = request.method() == hyper::Method::HEAD;
+                        async move {
+                            gateway.public(request, peer).await.map(|response| {
+                                response.map(|body| deadlines.response(id, body, head))
+                            })
+                        }
                     });
                     let mut builder = http1::Builder::new();
                     builder.timer(TokioTimer::new()).header_read_timeout(Limits::duration(limits.client_header_ms));
-                    let connection = builder.serve_connection(TokioIo::new(stream), service);
+                    let connection = builder.serve_connection(DeadlineIo {
+                        inner: TokioIo::new(stream), deadlines: deadlines.clone(),
+                    }, service);
                     tokio::pin!(connection);
-                    let result = tokio::select! {
-                        result = &mut connection => result,
-                        _ = receiver.changed() => {
-                            connection.as_mut().graceful_shutdown();
-                            connection.await
+                    loop {
+                        tokio::select! {
+                            result = &mut connection => {
+                                if result.is_err() { tracing::warn!(error_class = "client_or_stream", "connection_closed"); }
+                                break;
+                            },
+                            _ = deadlines.expired() => {
+                                tracing::warn!(error_class = "request_deadline", "connection_closed");
+                                break;
+                            },
+                            _ = receiver.changed(), if !*receiver.borrow() => {
+                                connection.as_mut().graceful_shutdown();
+                            }
                         }
-                    };
-                    if result.is_err() { tracing::warn!(error_class = "client_or_stream", "connection_closed"); }
+                    }
                 });
             },
             result = management.accept() => {

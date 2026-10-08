@@ -120,13 +120,6 @@ impl Gateway {
         })
     }
 
-    fn owner(&self, request: &Request<GatewayBody>) -> (&str, &dyn GatewayHandler) {
-        if let Some(family) = select_family(&self.families, &self.enabled, request) {
-            return (family.id, family.handler.as_ref());
-        }
-        ("legacy", self.legacy.as_ref())
-    }
-
     pub async fn public(
         &self,
         request: Request<Incoming>,
@@ -159,18 +152,20 @@ impl Gateway {
             &context,
             self.trusted_proxies.contains(&context.peer.ip()),
         );
-        let (owner, handler) = self.owner(&request);
-        let result = match result {
-            Ok(()) => match tokio::time::timeout_at(
-                context.deadline,
-                handler.handle(request, context.clone()),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(GatewayFailure::Deadline),
-            },
-            Err(error) => Err(error),
+        let selected_owner = select_family(&self.families, &self.enabled, &request)
+            .map_or("legacy", |family| family.id);
+        let (owner, result) = match result {
+            Ok(()) => {
+                dispatch(
+                    &self.families,
+                    &self.enabled,
+                    self.legacy.as_ref(),
+                    request,
+                    context.clone(),
+                )
+                .await
+            }
+            Err(error) => (selected_owner, Err(error)),
         };
         let error_class = match &result {
             Ok(_) => "none",
@@ -207,6 +202,28 @@ impl Gateway {
             .body(full(body))
             .expect("static response"))
     }
+}
+
+/// The legacy handler is mandatory, including when registrations are inactive.
+async fn dispatch<'registry>(
+    families: &'registry [FamilyRegistration],
+    enabled: &HashSet<String>,
+    legacy: &dyn GatewayHandler,
+    request: Request<GatewayBody>,
+    context: RequestContext,
+) -> (
+    &'registry str,
+    Result<Response<GatewayBody>, GatewayFailure>,
+) {
+    let (owner, handler): (&str, &dyn GatewayHandler) =
+        match select_family(families, enabled, &request) {
+            Some(family) => (family.id, family.handler.as_ref()),
+            None => ("legacy", legacy),
+        };
+    let result = tokio::time::timeout_at(context.deadline, handler.handle(request, context))
+        .await
+        .unwrap_or(Err(GatewayFailure::Deadline));
+    (owner, result)
 }
 
 fn select_family<'registry>(
@@ -331,6 +348,131 @@ mod tests {
             ],
             handler: Arc::new(Stub),
         }
+    }
+
+    struct RecordingStub {
+        name: &'static str,
+        calls: std::sync::Mutex<Vec<(String, String, SocketAddr)>>,
+    }
+
+    impl GatewayHandler for RecordingStub {
+        fn handle(
+            &self,
+            request: Request<GatewayBody>,
+            context: RequestContext,
+        ) -> HandlerFuture<'_> {
+            Box::pin(async move {
+                assert_eq!(request.method(), Method::POST);
+                assert_eq!(request.headers()["host"], "shop.example");
+                assert!(context.deadline > Instant::now());
+                assert!(!*context.shutdown.borrow());
+                let uri = request.uri().to_string();
+                assert_eq!(
+                    request.into_body().collect().await.unwrap().to_bytes(),
+                    "form=bytes"
+                );
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((uri, context.request_id, context.peer));
+                // Two distinct frames prove the dispatch seam returns a streaming body.
+                let body = TestFrames(VecDeque::from([
+                    bytes::Bytes::from_static(self.name.as_bytes()),
+                    bytes::Bytes::from_static(b" response"),
+                ]))
+                .boxed_unsync();
+                Ok(Response::builder()
+                    .status(StatusCode::CREATED)
+                    .header("x-owner", self.name)
+                    .body(body)
+                    .unwrap())
+            })
+        }
+    }
+
+    use std::collections::VecDeque;
+    struct TestFrames(VecDeque<bytes::Bytes>);
+    impl http_body::Body for TestFrames {
+        type Data = bytes::Bytes;
+        type Error = BoxError;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            std::task::Poll::Ready(
+                self.0
+                    .pop_front()
+                    .map(|bytes| Ok(http_body::Frame::data(bytes))),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_handler_dispatch_and_mandatory_fallback() {
+        let slice = Arc::new(RecordingStub {
+            name: "slice",
+            calls: Default::default(),
+        });
+        let legacy = RecordingStub {
+            name: "legacy",
+            calls: Default::default(),
+        };
+        let mut registration = family("account", "/app/account");
+        registration.handler = slice.clone();
+        let registry = vec![registration];
+        let context = RequestContext::probe(1000);
+        for (active, path, expected) in [
+            (false, "/app/account/edit?raw=%2F", "legacy"),
+            (true, "/app/account/edit?raw=%2F", "slice"),
+            (true, "/unknown?raw=%2F", "legacy"),
+        ] {
+            let enabled = if active {
+                HashSet::from(["account".into()])
+            } else {
+                HashSet::new()
+            };
+            validate_registry(&registry, &enabled.iter().cloned().collect::<Vec<_>>()).unwrap();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header("host", "shop.example")
+                .body(full("form=bytes"))
+                .unwrap();
+            let (owner, response) =
+                dispatch(&registry, &enabled, &legacy, request, context.clone()).await;
+            assert_eq!(
+                owner,
+                if expected == "slice" {
+                    "account"
+                } else {
+                    "legacy"
+                }
+            );
+            let response = response.unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            assert_eq!(response.headers()["x-owner"], expected);
+            let mut body = response.into_body();
+            assert_eq!(
+                body.frame().await.unwrap().unwrap().into_data().unwrap(),
+                expected
+            );
+            assert_eq!(
+                body.frame().await.unwrap().unwrap().into_data().unwrap(),
+                " response"
+            );
+            assert!(body.frame().await.is_none());
+            let calls = if expected == "slice" {
+                &slice.calls
+            } else {
+                &legacy.calls
+            };
+            assert_eq!(
+                calls.lock().unwrap().last().unwrap(),
+                &(path.into(), context.request_id.clone(), context.peer)
+            );
+        }
+        assert_eq!(slice.calls.lock().unwrap().len(), 1);
+        assert_eq!(legacy.calls.lock().unwrap().len(), 2);
     }
     #[test]
     fn registration_and_activation_are_separate() {

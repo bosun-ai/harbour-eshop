@@ -207,6 +207,8 @@ class TestUpstream(http.server.BaseHTTPRequestHandler):
             body = b"Hello!"
         elif self.path == "/large":
             body = b"x" * (2 * 1024 * 1024)
+        elif self.path == "/backpressure":
+            body = b"x" * (128 * 1024 * 1024)
         else:
             body = json.dumps({"path": self.path, "method": self.command,
                                "body": data.decode(), "headers": dict(self.headers)}).encode()
@@ -409,6 +411,62 @@ def adapter_checks(runtime, binary):
                     assert request.result()[0] == 200
                 assert process.wait(timeout=5) == 0
             assert "stopped" in log.read_text()
+            # Inspect the native server's TCP state without reading buffered output:
+            # recv() could unblock the writer and hide the deadline regression.
+            def established(client_port):
+                for table in ["/proc/net/tcp", "/proc/net/tcp6"]:
+                    for row in Path(table).read_text().splitlines()[1:]:
+                        fields = row.split()
+                        if (int(fields[1].split(":")[1], 16) == public_port
+                                and int(fields[2].split(":")[1], 16) == client_port
+                                and fields[3] == "01"):
+                            return True
+                return False
+
+            for idle_ms, draining in [(200, False), (1000, False), (1000, True)]:
+                deadline_config = runtime.config(f"backpressure-{idle_ms}-{draining}",
+                    f"https://localhost:{probe.port}/", {**changes,
+                        "total_request_ms = 180000": "total_request_ms = 500",
+                        "client_header_ms = 700": "client_header_ms = 2000",
+                        "upstream_response_ms = 1200": "upstream_response_ms = 400",
+                        "body_idle_ms = 700": f"body_idle_ms = {idle_ms}"}, local=True)
+                with log.open("w") as output:
+                    process = subprocess.Popen([str(binary)], env={**os.environ, "GATEWAY_CONFIG": str(deadline_config)}, stdout=output, stderr=output)
+                    runtime.processes.append(process)
+                    wait(lambda: native.request("/hello")[2] == b"Hello!")
+                    # Completed responses must not leave a total timer on idle keepalive.
+                    connection = http.client.HTTPSConnection("localhost", public_port, context=native.context, timeout=3)
+                    try:
+                        connection.request("GET", "/hello")
+                        assert connection.getresponse().read() == b"Hello!"
+                        keepalive_port = connection.sock.getsockname()[1]
+                        time.sleep(0.8)
+                        assert established(keepalive_port), "total timer closed idle keepalive"
+                        connection.request("GET", "/hello")
+                        assert connection.getresponse().read() == b"Hello!"
+                        connection.request("HEAD", "/hello")
+                        assert connection.getresponse().read() == b""
+                        time.sleep(0.6)
+                        assert established(keepalive_port), "HEAD left an active total timer"
+                    finally:
+                        connection.close()
+                    with socket.create_connection(("localhost", public_port), timeout=3) as connection:
+                        connection.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+                        with native.context.wrap_socket(connection, server_hostname="localhost") as stream:
+                            client_port = stream.getsockname()[1]
+                            before = counts().get("/backpressure", 0)
+                            stream.sendall(b"GET /backpressure HTTP/1.1\r\nHost: shop.example\r\n\r\n")
+                            wait(lambda: counts().get("/backpressure", 0) > before, seconds=1)
+                            assert established(client_port), "probe never established a request"
+                            started = time.monotonic()
+                            if draining:
+                                process.terminate()
+                            wait(lambda: not established(client_port), seconds=1.5)
+                            assert time.monotonic() - started < 1.5, "non-reading client bypassed deadline"
+                    if not draining:
+                        process.terminate()
+                    assert process.wait(timeout=3) == 0
+                assert '"error_class":"request_deadline"' in log.read_text()
             abort_config = runtime.config("abort-drain", f"https://localhost:{probe.port}/",
                                           {**changes, "shutdown_ms = 30000": "shutdown_ms = 100"}, local=True)
             with log.open("w") as output:
