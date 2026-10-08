@@ -1,0 +1,19 @@
+# Paths are explicit read-only inputs; never put private key contents here.
+public_bind = "0.0.0.0:8002"
+management_bind = "0.0.0.0:9000"
+upstream_url = "https://legacy:8002/"
+public_certificate = "/run/gateway/public.crt"
+public_key = "/run/gateway/public.key"
+upstream_ca = "/run/gateway/upstream.crt"
+trusted_proxies = [] # Exact peer IP addresses, not CIDR ranges.
+enabled_families = []
+log_level = "info"
+
+[limits]
+connect_ms = 5000
+client_header_ms = 10000
+body_idle_ms = 130000
+upstream_response_ms = 150000
+total_request_ms = 180000
+readiness_ms = 3000
+shutdown_ms = 30000

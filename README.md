@@ -48,6 +48,8 @@ These are faithful to upstream and good material for a migration:
 
 ## Run it
 
+An optional, opt-in Rust all-legacy HTTPS gateway is documented in [`gateway/README.md`](gateway/README.md). It does not replace or activate changes to the legacy entrypoints below.
+
 The only requirement is Docker. Harbour isn't packaged by current Debian or Ubuntu releases, so the image builds it from source at a pinned commit. The first build takes a few minutes.
 
 ```sh
