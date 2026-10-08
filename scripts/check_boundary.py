@@ -144,6 +144,9 @@ class Probe(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     records = []
     lock = threading.Lock()
+    hello_started = threading.Event()
+    hello_release = threading.Event()
+    hold_hello = False
 
     def log_message(self, *_):
         pass
@@ -181,6 +184,9 @@ class Probe(BaseHTTPRequestHandler):
                 self.connection.close()
                 return
         if self.path == "/hello":
+            if self.hold_hello:
+                self.hello_started.set()
+                assert self.hello_release.wait(timeout=5), "delayed probe not released"
             payload = b"Hello!"
         else:
             payload = json.dumps({"path": self.path, "headers": dict(self.headers),
@@ -308,6 +314,25 @@ def native_checks(directory, ca, cert, key):
         assert outcome and outcome[0][0] == 200
         assert server.fileno() >= 0
         print("PASS graceful SIGTERM drain and upstream independence")
+        start()
+        Probe.hello_started.clear()
+        Probe.hello_release.clear()
+        Probe.hold_hello = True
+        readiness = []
+        worker = threading.Thread(target=lambda: readiness.append(admin_native(admin_port, "/ready")))
+        worker.start()
+        assert Probe.hello_started.wait(timeout=2), "readiness probe did not reach upstream"
+        log_offset = log_path.stat().st_size
+        process.terminate()
+        wait(lambda: '"event":"draining"' in log_path.read_text()[log_offset:],
+             "shutdown before releasing readiness probe", seconds=1)
+        Probe.hello_release.set()
+        worker.join(timeout=5)
+        process.wait(timeout=5)
+        assert process.returncode == 0 and readiness == [503], readiness
+        process = None
+        Probe.hold_hello = False
+        print("PASS delayed readiness probe returns 503 after SIGTERM begins draining")
         start({"SHUTDOWN_TIMEOUT_SECONDS": "1", "UPSTREAM_TIMEOUT_SECONDS": "10"})
         interrupted = []
         def stalled_request():
@@ -337,6 +362,8 @@ def native_checks(directory, ca, cert, key):
         assert '"event":"draining"' in logs
         print("PASS TLS hostname/chain rejection and secret-free gateway logs")
     finally:
+        Probe.hold_hello = False
+        Probe.hello_release.set()
         if process and process.poll() is None:
             process.terminate()
             try:

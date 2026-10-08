@@ -221,7 +221,7 @@ pub async fn run(
                         async move {
                             let result = match (request.method().as_str(), request.uri().path()) {
                                 ("GET", "/live") => response(StatusCode::OK, "Live\n"),
-                                ("GET", "/ready") if !*state.borrow() && legacy.ready().await => response(StatusCode::OK, "Ready\n"),
+                                ("GET", "/ready") if !*state.borrow() && legacy.ready().await && !*state.borrow() => response(StatusCode::OK, "Ready\n"),
                                 ("GET", "/ready") => response(StatusCode::SERVICE_UNAVAILABLE, "Not ready\n"),
                                 _ => response(StatusCode::NOT_FOUND, "Not found\n"),
                             };
@@ -256,4 +256,209 @@ pub async fn run(
     }
     tracing::info!(event = "stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatch::{Handler, HandlerResult, Path, Registration};
+    use hyper::Method;
+    use std::{collections::HashSet, net::SocketAddr, sync::Mutex};
+
+    #[derive(Debug)]
+    struct Call {
+        owner: &'static str,
+        method: Method,
+        uri: String,
+        host: String,
+        body: Bytes,
+        peer: SocketAddr,
+        correlation_id: u64,
+    }
+
+    struct RecordingHandler {
+        owner: &'static str,
+        calls: Arc<Mutex<Vec<Call>>>,
+    }
+
+    impl Handler for RecordingHandler {
+        fn handle(&self, request: Request<Body>, context: Context) -> HandlerResult {
+            let (owner, calls) = (self.owner, self.calls.clone());
+            Box::pin(async move {
+                let (parts, body) = request.into_parts();
+                let body = body.collect().await?.to_bytes();
+                calls.lock().unwrap().push(Call {
+                    owner,
+                    method: parts.method,
+                    uri: parts.uri.to_string(),
+                    host: parts.headers["host"].to_str().unwrap().to_owned(),
+                    body,
+                    peer: context.peer,
+                    correlation_id: context.correlation_id,
+                });
+                Ok(Response::builder()
+                    .status(StatusCode::CREATED)
+                    .header("x-test-owner", owner)
+                    .body(full(owner))
+                    .unwrap())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn application_executes_only_the_activated_owner() {
+        let config = Arc::new(Config {
+            public_bind: "127.0.0.1:0".parse().unwrap(),
+            admin_bind: "127.0.0.1:0".parse().unwrap(),
+            upstream: "https://localhost/".parse().unwrap(),
+            enabled: HashSet::new(),
+            connect: Duration::from_secs(1),
+            client_read: Duration::from_secs(1),
+            upstream_timeout: Duration::from_secs(1),
+            shutdown: Duration::from_secs(1),
+            log_level: tracing::Level::INFO,
+            public_tls: Arc::new(
+                rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_cert_resolver(
+                        Arc::new(rustls::server::ResolvesServerCertUsingSni::new()),
+                    ),
+            ),
+            upstream_tls: Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(rustls::RootCertStore::empty())
+                    .with_no_client_auth(),
+            ),
+        });
+        let calls = Arc::new(Mutex::new(Vec::<Call>::new()));
+        let handler = |owner| -> Arc<dyn Handler> {
+            Arc::new(RecordingHandler {
+                owner,
+                calls: calls.clone(),
+            })
+        };
+        let mut correlation_ids = HashSet::new();
+        for (registered, enabled) in [(false, false), (true, false), (true, true)] {
+            let registrations = if registered {
+                vec![
+                    Registration {
+                        id: "exact",
+                        path: Path::Exact("/test/exact"),
+                        methods: vec![Method::GET, Method::POST],
+                        handler: handler("exact"),
+                    },
+                    Registration {
+                        id: "family",
+                        path: Path::Family("/test/family"),
+                        methods: vec![Method::GET, Method::POST],
+                        handler: handler("family"),
+                    },
+                ]
+            } else {
+                vec![]
+            };
+            let dispatch = Arc::new(
+                Dispatch::new(
+                    registrations,
+                    if enabled {
+                        HashSet::from(["exact".into(), "family".into()])
+                    } else {
+                        HashSet::new()
+                    },
+                    handler("legacy"),
+                )
+                .unwrap(),
+            );
+            for (path, method, owner) in [
+                ("/test/exact?raw=%2F", Method::POST, "exact"),
+                ("/test/family", Method::GET, "family"),
+                ("/test/family/child?raw=%2B", Method::POST, "family"),
+                ("/test/exact/child", Method::POST, "legacy"),
+                ("/test/familyish", Method::POST, "legacy"),
+                ("/unknown", Method::POST, "legacy"),
+                ("/test/exact", Method::PUT, "exact"),
+                ("/test/family/child", Method::PUT, "family"),
+            ] {
+                // HTTP/1 supplies a real Incoming body to the production application path.
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let peer = stream.local_addr().unwrap();
+                let (server_stream, _) = listener.accept().await.unwrap();
+                let (config, dispatch) = (config.clone(), dispatch.clone());
+                let server = tokio::spawn(async move {
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(server_stream),
+                            service_fn(move |request| {
+                                application(request, peer, config.clone(), dispatch.clone())
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                });
+                let (mut sender, connection) =
+                    hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                        .await
+                        .unwrap();
+                let client = tokio::spawn(connection);
+                let before = calls.lock().unwrap().len();
+                let result = timeout(
+                    Duration::from_secs(3),
+                    sender.send_request(
+                        Request::builder()
+                            .method(method.clone())
+                            .uri(path)
+                            .header("host", "public.example:8002")
+                            .header("connection", "close")
+                            .body(full("test request body"))
+                            .unwrap(),
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let denied = enabled && owner != "legacy" && method == Method::PUT;
+                if denied {
+                    assert_eq!(result.status(), StatusCode::METHOD_NOT_ALLOWED);
+                    assert_eq!(result.headers()["allow"], "GET, POST");
+                    assert_eq!(calls.lock().unwrap().len(), before);
+                    assert_eq!(
+                        result.into_body().collect().await.unwrap().to_bytes(),
+                        "Method not allowed\n"
+                    );
+                } else {
+                    let expected = if enabled { owner } else { "legacy" };
+                    assert_eq!(result.status(), StatusCode::CREATED);
+                    assert_eq!(result.headers()["x-test-owner"], expected);
+                    assert_eq!(
+                        result.into_body().collect().await.unwrap().to_bytes(),
+                        expected
+                    );
+                    let calls = calls.lock().unwrap();
+                    assert_eq!(calls.len(), before + 1);
+                    let call = calls.last().unwrap();
+                    assert_eq!(call.owner, expected);
+                    assert_eq!(call.method, method);
+                    assert_eq!(call.uri, path);
+                    assert_eq!(call.host, "public.example:8002");
+                    assert_eq!(call.body, "test request body");
+                    assert_eq!(call.peer, peer);
+                    assert_ne!(call.correlation_id, 0);
+                    assert!(correlation_ids.insert(call.correlation_id));
+                }
+                timeout(Duration::from_secs(3), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                timeout(Duration::from_secs(3), client)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            }
+        }
+        assert!(crate::dispatch::registrations().is_empty());
+    }
 }
