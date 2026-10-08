@@ -100,4 +100,9 @@ docker-entrypoint.sh     creates a self-signed certificate, starts eshop
 
 ## CI
 
-[`build.yml`](.github/workflows/build.yml) builds the Docker image, which compiles Harbour and `eshop.prg` with warnings treated as errors (`-w3 -es2`). It then starts the container and checks that `/hello` responds. The code is upstream sample code, so there's no separate test suite.
+An additive, opt-in Rust HTTP boundary and disposable checks are documented in
+[`docs/bootstrap.md`](docs/bootstrap.md). It initially forwards every application
+request to Harbour; building or merging it does not replace the default run path
+or activate any independent application route.
+
+[`build.yml`](.github/workflows/build.yml) builds the Docker image, which compiles Harbour and `eshop.prg` with warnings treated as errors (`-w3 -es2`). It then starts the container and checks that `/hello` responds. The unchanged Harbour application has no separate unit suite; the optional gateway has focused Rust tests and local boundary checks.
