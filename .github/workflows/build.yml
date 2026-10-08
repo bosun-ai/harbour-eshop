@@ -32,3 +32,15 @@ jobs:
           done
           docker logs eshop
           exit 1
+
+      - name: Gateway static checks
+        run: |
+          cargo build --locked --manifest-path gateway/Cargo.toml
+          cargo test --locked --manifest-path gateway/Cargo.toml
+          cargo fmt --manifest-path gateway/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path gateway/Cargo.toml --all-targets -- -D warnings
+
+      - name: Build optional gateway and verify disposable boundary
+        run: |
+          docker build -f gateway/Dockerfile -t eshop-gateway:ci gateway
+          python3 gateway/tests/verify.py --legacy-image harbour-eshop:ci --gateway-image eshop-gateway:ci
