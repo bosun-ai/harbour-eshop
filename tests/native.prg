@@ -45,7 +45,7 @@ PROCEDURE Main()
    nBefore := Len( Directory( "/proc/self/fd/*", "HSD" ) )
    Check( nBefore >= 3, "descriptor observation available" )
    FOR nRepeat := 1 TO 3
-      FOR EACH cMode IN { "partial", "hang", "stdout", "stderr" }
+      FOR EACH cMode IN { "partial", "sigkill", "sigterm", "sigsegv", "hang", "stdout", "stderr" }
          hb_SetEnv( "ESHOP_TEST_MODE", cMode )
          s_cWritten := ""
          s_nFallback := 0

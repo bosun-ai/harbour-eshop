@@ -49,7 +49,7 @@ FUNCTION SliceBody( cId )
          ENDIF
       ENDIF
       IF nExit == -1
-         nExit := hb_processValue( hProcess, .F. )
+         nExit := SliceProcessValue( hProcess, .F. )
       ENDIF
       IF nExit < -1 .OR. nExit > 0
          lValid := .F.
@@ -67,9 +67,50 @@ FUNCTION SliceBody( cId )
    ENDIF
    IF nExit == -1
       hb_processClose( hProcess, .F. )
-      hb_processValue( hProcess, .T. )
+      SliceProcessValue( hProcess, .T. )
    ENDIF
    IF lValid .AND. nExit == 0
       RETURN cBody
    ENDIF
    RETURN NIL
+
+#pragma BEGINDUMP
+#include "hbapi.h"
+#include "hbapifs.h"
+#include "hbvm.h"
+
+#if defined( HB_OS_UNIX )
+#include <errno.h>
+#include <sys/wait.h>
+#endif
+
+/* Like hb_processValue, but only a normal zero exit can succeed on Unix.
+ * -1 means still running; -2 means wait failure or abnormal termination.
+ * waitpid both polls and reaps; release the VM while waiting. */
+HB_FUNC( SLICEPROCESSVALUE )
+{
+#if defined( HB_OS_UNIX )
+   pid_t pid = ( pid_t ) hb_parnint( 1 ), result;
+   int status, value = -2;
+   int options = hb_parl( 2 ) ? 0 : WNOHANG;
+
+   if( pid > 0 )
+   {
+      hb_vmUnlock();
+      do
+      {
+         result = waitpid( pid, &status, options );
+      }
+      while( result < 0 && errno == EINTR );
+      if( result == 0 )
+         value = -1;
+      else if( result > 0 && WIFEXITED( status ) )
+         value = WEXITSTATUS( status );
+      hb_vmLock();
+   }
+   hb_retni( value );
+#else
+   hb_retni( hb_fsProcessValue( ( HB_FHANDLE ) hb_parnint( 1 ), hb_parl( 2 ) ) );
+#endif
+}
+#pragma ENDDUMP

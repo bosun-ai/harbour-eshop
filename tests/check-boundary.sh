@@ -51,11 +51,11 @@ printf 'Hello!' > "$scratch/legacy-body"
 cmp "$scratch/baseline-0.body" "$scratch/legacy-body"
 ! grep -qi '^Set-Cookie:' "$scratch/baseline-0.headers"
 
-for variant in optional disabled selected rollback partial hang stdout stderr missing; do
+for variant in optional disabled selected rollback partial sigkill sigterm sigsegv hang stdout stderr missing; do
   image=$fixture
   [ "$variant" != optional ] || image=$optional
   start "$variant" "$image"
-  if [ "$variant" = selected ] || [ "$variant" = rollback ] || [ "$variant" = partial ] || [ "$variant" = hang ] || [ "$variant" = stdout ] || [ "$variant" = stderr ] || [ "$variant" = missing ]; then
+  if [ "$variant" = selected ] || [ "$variant" = rollback ] || [ "$variant" = partial ] || [ "$variant" = sigkill ] || [ "$variant" = sigterm ] || [ "$variant" = sigsegv ] || [ "$variant" = hang ] || [ "$variant" = stdout ] || [ "$variant" = stderr ] || [ "$variant" = missing ]; then
     # Restart via the same entrypoint with explicit configuration, never embedded in an image.
     docker rm -f "$name" >/dev/null
     mode=$variant
