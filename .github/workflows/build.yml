@@ -25,10 +25,58 @@ jobs:
 
       - name: Server starts and answers
         run: |
+          trap 'docker rm -f eshop >/dev/null 2>&1 || true' EXIT
           docker run -d --name eshop -p 8002:8002 harbour-eshop:ci
           for _ in $(seq 1 30); do
-            curl -skf https://localhost:8002/hello && exit 0
+            curl -skf --max-time 2 https://localhost:8002/hello && exit 0
             sleep 1
           done
           docker logs eshop
           exit 1
+
+      - name: Build optional boundary image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: slices
+          load: true
+          tags: eshop-slices-check
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build test-only ownership and executable
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: boundary-test
+          load: true
+          tags: eshop-boundary-test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Native generated-code coverage
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: boundary-coverage
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Selection, failures, compatibility, and rollback
+        run: timeout 240 sh tests/check-boundary.sh harbour-eshop:ci eshop-slices-check eshop-boundary-test
+
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: slices
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
+      - name: Build discovered production binaries when present
+        run: |
+          if [ -d src/bin ] && find src/bin -name '*.rs' -print | grep -q .; then
+            cargo build --locked --release --bins
+          fi
