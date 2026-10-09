@@ -6,13 +6,13 @@ A small legacy-style web shop written in [Harbour](https://github.com/harbour/co
 
 ## Where the code comes from
 
-Everything in [`app/`](app/) is copied **unmodified** from the official Harbour repository:
+The application in [`app/`](app/) comes from the official Harbour repository, with one mount-table integration for the default-disabled subprocess boundary:
 
 - Source: [`harbour/core` → `contrib/hbhttpd/tests/`](https://github.com/harbour/core/tree/529b0d42939610a13da1572cd7861da6f9fa2d47/contrib/hbhttpd/tests)
 - Pinned commit: [`529b0d4`](https://github.com/harbour/core/commit/529b0d42939610a13da1572cd7861da6f9fa2d47)
 - License: Harbour's GPL with the Harbour exception, see [`LICENSE.txt`](LICENSE.txt) (copied from the same commit)
 
-This repository only adds the build and run plumbing: `Dockerfile`, `docker-entrypoint.sh`, and the CI workflow.
+This repository adds build/run plumbing and a body-only bootstrap boundary. No application handler has been migrated.
 
 ## What the application does
 
@@ -78,7 +78,8 @@ With Harbour installed from source (`make install` in `harbour/core`, with `libs
 
 ```sh
 cd app
-hbmk2 eshop.prg        # uses hbmk.hbm: hbhttpd + hbssl, -w3 -es2
+hbmk2 eshop.prg ../boundary/selector.prg ../boundary/process.prg ../boundary/ownership.prg
+# uses hbmk.hbm: hbhttpd + hbssl, -w3 -es2
 openssl req -x509 -newkey rsa:2048 -nodes -days 730 -subj "/CN=localhost" \
   -keyout private.key -out certificate.crt
 ./eshop                # ./eshop //stop stops it from another shell
@@ -87,7 +88,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 730 -subj "/CN=localhost" \
 ## Repository layout
 
 ```
-app/                     unmodified upstream sources
+app/                     upstream application with one mount-table hook
   eshop.prg              the application
   hbmk.hbm               build options (hbhttpd, hbssl)
   users.dbf items.dbf carts.dbf
@@ -96,8 +97,48 @@ app/                     unmodified upstream sources
 Dockerfile               builds Harbour, compiles eshop, packages the runtime
 docker-entrypoint.sh     creates a self-signed certificate, starts eshop
 .github/workflows/       CI: compiles eshop and checks that the server answers
+boundary/                native selector, bounded adapter, empty ownership registry
+slices/                  library-only Rust contract; examples are test fixtures
+tests/                   native and temporary-container acceptance checks
 ```
 
 ## CI
 
-[`build.yml`](.github/workflows/build.yml) builds the Docker image, which compiles Harbour and `eshop.prg` with warnings treated as errors (`-w3 -es2`). It then starts the container and checks that `/hello` responds. The code is upstream sample code, so there's no separate test suite.
+[`build.yml`](.github/workflows/build.yml) retains the legacy Docker build and HTTPS smoke check. It also checks Rust formatting, Clippy, unit tests, optional packaging, native selection/failure checks, and focused HTTP compatibility/rollback checks. All explicit selection uses a test-only ownership record and Rust example, never production ownership.
+
+## Subprocess Bootstrap
+
+The production registry in `boundary/ownership.prg` is empty. The default image remains legacy-only. Neither adding ownership nor packaging a binary activates it: only an explicit `ESHOP_ENABLED_SLICE=hello` at startup can select registered ownership. Unknown IDs, duplicate registrations, and missing or non-executable packages fail startup. Setting `hello` in this bootstrap therefore fails, intentionally.
+
+Build the optional image without enabling anything:
+
+```sh
+docker build --target slices -t harbour-eshop:slices .
+docker run --rm -p 8002:8002 harbour-eshop:slices
+```
+
+A future qualifying `/hello` implementation needs only `slices/src/bin/hello.rs` and one ownership record `{ "hello", "/hello", { "GET", "POST" } }`. Cargo discovers the executable; packaging places it at `/opt/eshop-slices/hello`. Keep its domain function separate from stdin/stdout integration. Do not add other slice types to this bootstrap.
+
+The contract is exactly `ESHOP-BODY/1\n` on stdin followed by EOF. A helper validates it using `read_invocation`, produces only body bytes on stdout using `write_body`, then exits zero. It must finish within 1,000 milliseconds, emit at most 65,536 body bytes, and emit at most 65,536 diagnostic bytes on stderr. Empty bodies are valid. The native adapter buffers output before writing; spawn errors, deadline expiry, nonzero exit, signal termination, or excess output invoke the original stateless callback once. Diagnostics are drained but never sent to clients. Pipes close and the direct child is terminated/reaped on failure. Helpers must not spawn descendants or access `/app`; this is a contract, **not filesystem or process security isolation**.
+
+Only exact `/hello` GET and POST requests are candidates; query strings do not change selection. Request bodies, cookies, sessions, headers, and paths never cross stdin. Harbour still handles HTTPS, method rejection, status, headers, content type, and connections. `/hello/`, adjacent paths, all other routes, and static files remain unchanged. This stateless fallback is not a replay policy for mutable routes.
+
+To verify locally with Docker, curl, `timeout`, and standard shell tools:
+
+```sh
+docker build -t eshop-legacy-check .
+docker build --target slices -t eshop-slices-check .
+docker build --target boundary-test -t eshop-boundary-test .
+docker build --target boundary-coverage -t eshop-boundary-coverage .
+timeout 240 sh tests/check-boundary.sh
+cd slices
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+```
+
+Tests compare exact HTTP bodies and headers (except date/server), default/disabled/selected/cleared selection, GET/POST/query/trailing-slash/unsupported methods, root redirect, login, CSS, and unknown paths. Native and HTTP checks exercise partial-output failure after a nonzero exit or SIGKILL/SIGTERM/SIGSEGV. Native checks also cover hanging helpers, stdout/stderr bounds, absent executables, descriptor counts, and unreaped children. The coverage target measures generated C function entry coverage and the process-status wrapper, not Harbour p-code branch coverage; it is not a claim of full source coverage.
+
+Future activation requires packaging the stateless implementation, registering ownership, passing these checks, then explicitly setting its ID and restarting using the existing deployment mechanism. Rollback clears the setting and restarts, or restores the legacy image. No data conversion is involved. A Harbour restart may invalidate process-local sessions.
+
+Deferred: production `/hello` domain code, public gateway, orchestration, session sharing, DBF/persistence access, rendering, mutable routes, generalized HTTP forwarding, workers, telemetry infrastructure, and stricter isolation.

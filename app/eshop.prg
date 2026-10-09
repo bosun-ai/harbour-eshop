@@ -16,7 +16,7 @@ MEMVAR server, get, post, cookie, session
 
 PROCEDURE Main()
 
-   LOCAL oServer
+   LOCAL oServer, hMount, cSliceError
 
    LOCAL oLogAccess
    LOCAL oLogError
@@ -96,6 +96,28 @@ PROCEDURE Main()
       RETURN
    ENDIF
 
+   hMount := { ;
+         "/hello"            => {|| UWrite( "Hello!" ) }, ;
+         "/info"             => {|| UProcInfo() }, ;
+         "/files/*"          => {| x | QOut( hb_DirBase() + "/files/" + X ), UProcFiles( hb_DirBase() + "/files/" + X, .F. ) }, ;
+         "/app/login"        => @proc_login(), ;
+         "/app/logout"       => @proc_logout(), ;
+         "/app/account"      => @proc_account(), ;
+         "/app/account/edit" => @proc_account_edit(), ;
+         "/app/register"     => @proc_register(), ;
+         "/app/main"         => @proc_main(), ;
+         "/app/shopping"     => @proc_shopping(), ;
+         "/app/cart"         => @proc_cart(), ;
+         "/"                 => {|| URedirect( "/app/login" ) } }
+   hMount := SliceMounts( hMount, SliceOwnership(), hb_GetEnv( "ESHOP_ENABLED_SLICE" ), @cSliceError )
+   IF hMount == NIL
+      ? "Slice configuration error:", cSliceError
+      oLogError:Close()
+      oLogAccess:Close()
+      ErrorLevel( 1 )
+      RETURN
+   ENDIF
+
    ? "Listening on port:", nPort := 8002
 
    oServer := UHttpdNew()
@@ -110,19 +132,7 @@ PROCEDURE Main()
          "PrivateKeyFilename"  => "private.key", ;
          "CertificateFilename" => "certificate.crt", ;
          "SSL"                 => .T., ;
-         "Mount"          => { ;
-         "/hello"            => {|| UWrite( "Hello!" ) }, ;
-         "/info"             => {|| UProcInfo() }, ;
-         "/files/*"          => {| x | QOut( hb_DirBase() + "/files/" + X ), UProcFiles( hb_DirBase() + "/files/" + X, .F. ) }, ;
-         "/app/login"        => @proc_login(), ;
-         "/app/logout"       => @proc_logout(), ;
-         "/app/account"      => @proc_account(), ;
-         "/app/account/edit" => @proc_account_edit(), ;
-         "/app/register"     => @proc_register(), ;
-         "/app/main"         => @proc_main(), ;
-         "/app/shopping"     => @proc_shopping(), ;
-         "/app/cart"         => @proc_cart(), ;
-         "/"                 => {|| URedirect( "/app/login" ) } } } )
+         "Mount"               => hMount } )
       oLogError:Close()
       oLogAccess:Close()
       ? "Server error:", oServer:cError

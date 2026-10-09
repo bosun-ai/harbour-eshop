@@ -5,3 +5,4 @@ app/*.log
 app/private.key
 app/certificate.crt
 app/eshop
+slices/target
